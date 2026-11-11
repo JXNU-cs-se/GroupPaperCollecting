@@ -36,6 +36,10 @@
 - 首次 clone 后先执行一次 `sh scripts/install_hooks.sh` 安装 hook；没装 hook 时（例如网页上传）由 GitHub Actions 兜底完成第 2~4 步，但补出来的文件只能落在下一个 commit。
 - 完整目录结构与提交流程见 [CONTRIBUTING.md](CONTRIBUTING.md)。
 
+## Code Summarization
+
+1： LECLAIR A, HAQUE S, WU L, et al. [Improved Code Summarization via a Graph Neural Network](papers/lihongwei/Improved%20Code%20Summarization%20via%20a%20Graph%20Neural%20Network.pdf)[C]//Proceedings of the 28th International Conference on Program Comprehension. ACM, 2020: 184-195. : [lihongweimail]（BibTeX 自动生成，待核对）  
+
 ## Intelligence Software Engineering
 
 1： ZHANG Z, WEN T, SUN S, et al. [WeSCE: A Benchmark for Measuring Security Drift in LLM-Driven Code Editing](papers/lihongwei/WeSCE%20A%20Benchmark%20for%20Measuring%20Security.pdf)[J]. arXiv preprint arXiv:2608.15092, 2026. : [lihongweimail]  
