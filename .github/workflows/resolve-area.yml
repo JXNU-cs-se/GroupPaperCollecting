@@ -1,0 +1,106 @@
+name: Resolve Research Area and Missing BibTeX
+
+# A contributor may add ONLY a PDF. This workflow then:
+#   1. generates <stem>.bib next to it with scripts/pdf_to_bib.py --ci,
+#   2. writes <stem>.research-area from the "[AREA: ...]" commit message,
+#   3. commits BOT kinds of generated files in one follow-up commit,
+#   4. dispatches "Build README" so the new paper appears in the index.
+#
+# GitHub Actions only runs AFTER a push, so the generated .bib necessarily
+# lands in the bot commit immediately following the contributor's PDF commit.
+# From a member's point of view one push still completes the whole entry.
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'papers/**'
+      # A push that only contains generated markers must not re-trigger us.
+      # Markers are one-per-paper: <stem>.research-area
+      - '!papers/**/*.research-area'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: write   # needed for `gh workflow run` at the end of the job
+
+concurrency:
+  group: resolve-research-area
+  cancel-in-progress: false
+
+jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # A push may contain several commits covering several areas. Full
+          # history lets parse_area.py attribute each paper to its own commit.
+          fetch-depth: 0
+
+      - name: Sync with the latest main
+        # Two members can push at almost the same time. Starting from the
+        # newest main avoids regenerating a .bib another run just committed.
+        run: |
+          git fetch origin main
+          git checkout -B ci-work origin/main
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install PDF metadata dependencies
+        run: pip install -r requirements-pdf.txt
+
+      - name: Generate missing .bib files for PDF-only contributions
+        id: bibs
+        run: |
+          python3 scripts/pdf_to_bib.py --ci \
+            --list-generated "$RUNNER_TEMP/generated-bibs.txt"
+
+      - name: Resolve research areas
+        env:
+          BASE_SHA: ${{ github.event.before }}
+        run: python3 scripts/parse_area.py
+
+      - name: Commit generated .bib and .research-area files
+        id: commit
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # Stage only what this run generated. Paths may contain spaces, so
+          # read the list line by line instead of using word splitting.
+          while IFS= read -r f; do
+            [ -n "$f" ] && git add -- "$f"
+          done < "$RUNNER_TEMP/generated-bibs.txt"
+          git add --all -- ':(glob)papers/**/*.research-area'
+
+          if git diff --cached --quiet; then
+            echo "Nothing to commit."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            git commit -m "[skip ci] chore: generate BibTeX and resolve research areas"
+            pushed=0
+            for attempt in 1 2 3; do
+              if git push origin HEAD:main; then pushed=1; break; fi
+              echo "push rejected (attempt $attempt); rebasing on latest main"
+              git fetch origin main
+              git rebase origin/main || { git rebase --abort; break; }
+              sleep 3
+            done
+            if [ "$pushed" -ne 1 ]; then
+              echo "::error::could not push the generated .bib / marker files"
+              exit 1
+            fi
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # A commit pushed with GITHUB_TOKEN does NOT trigger push-based workflows
+      # (GitHub's recursion guard). workflow_dispatch is an explicit exception,
+      # so we dispatch the README build here instead of relying on its push
+      # path filter. Without this step the README would never be regenerated.
+      - name: Trigger README rebuild
+        if: steps.commit.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh workflow run build-readme.yml --ref main
