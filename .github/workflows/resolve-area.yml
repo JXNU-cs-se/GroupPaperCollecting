@@ -1,14 +1,14 @@
-name: Resolve Research Area and Missing BibTeX
+name: Resolve Research Area
 
-# A contributor may add ONLY a PDF. This workflow then:
-#   1. generates <stem>.bib next to it with scripts/pdf_to_bib.py --ci,
-#   2. writes <stem>.research-area from the "[AREA: ...]" commit message,
-#   3. commits BOT kinds of generated files in one follow-up commit,
-#   4. dispatches "Build README" so the new paper appears in the index.
+# BibTeX is generated in the contributor's LOCAL pre-commit hook
+# (.githooks/pre-commit), so a PDF and its .bib always share ONE commit. This
+# workflow therefore never generates files: it verifies the invariant, then
+# writes the per-paper research-area marker from the "[AREA: ...]" commit
+# message and refreshes README.md.
 #
-# GitHub Actions only runs AFTER a push, so the generated .bib necessarily
-# lands in the bot commit immediately following the contributor's PDF commit.
-# From a member's point of view one push still completes the whole entry.
+# A PDF pushed without a .bib (e.g. uploaded through the web UI, which cannot
+# run hooks) fails the verification step on purpose: a bot-generated .bib would
+# land in a second commit and break the same-commit guarantee.
 on:
   push:
     branches: [main]
@@ -38,8 +38,6 @@ jobs:
           fetch-depth: 0
 
       - name: Sync with the latest main
-        # Two members can push at almost the same time. Starting from the
-        # newest main avoids regenerating a .bib another run just committed.
         run: |
           git fetch origin main
           git checkout -B ci-work origin/main
@@ -48,38 +46,29 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install PDF metadata dependencies
-        run: pip install -r requirements-pdf.txt
-
-      - name: Generate missing .bib files for PDF-only contributions
-        id: bibs
-        run: |
-          python3 scripts/pdf_to_bib.py --ci \
-            --list-generated "$RUNNER_TEMP/generated-bibs.txt"
+      - name: Verify every PDF is committed with its BibTeX
+        # Read-only: lists the offending files and exits 1, with instructions to
+        # enable the hook and amend. No dependency install needed (no parsing).
+        run: python3 scripts/pdf_to_bib.py --check --fail
 
       - name: Resolve research areas
         env:
           BASE_SHA: ${{ github.event.before }}
         run: python3 scripts/parse_area.py
 
-      - name: Commit generated .bib and .research-area files
+      - name: Commit .research-area markers
         id: commit
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          # Stage only what this run generated. Paths may contain spaces, so
-          # read the list line by line instead of using word splitting.
-          while IFS= read -r f; do
-            [ -n "$f" ] && git add -- "$f"
-          done < "$RUNNER_TEMP/generated-bibs.txt"
           git add --all -- ':(glob)papers/**/*.research-area'
 
           if git diff --cached --quiet; then
             echo "Nothing to commit."
             echo "changed=false" >> "$GITHUB_OUTPUT"
           else
-            git commit -m "[skip ci] chore: generate BibTeX and resolve research areas"
+            git commit -m "[skip ci] chore: resolve research areas"
             pushed=0
             for attempt in 1 2 3; do
               if git push origin HEAD:main; then pushed=1; break; fi
@@ -89,7 +78,7 @@ jobs:
               sleep 3
             done
             if [ "$pushed" -ne 1 ]; then
-              echo "::error::could not push the generated .bib / marker files"
+              echo "::error::could not push the generated research-area markers"
               exit 1
             fi
             echo "changed=true" >> "$GITHUB_OUTPUT"
