@@ -1,0 +1,95 @@
+name: Resolve Research Area
+
+# BibTeX is generated in the contributor's LOCAL pre-commit hook
+# (.githooks/pre-commit), so a PDF and its .bib always share ONE commit. This
+# workflow therefore never generates files: it verifies the invariant, then
+# writes the per-paper research-area marker from the "[AREA: ...]" commit
+# message and refreshes README.md.
+#
+# A PDF pushed without a .bib (e.g. uploaded through the web UI, which cannot
+# run hooks) fails the verification step on purpose: a bot-generated .bib would
+# land in a second commit and break the same-commit guarantee.
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'papers/**'
+      # A push that only contains generated markers must not re-trigger us.
+      # Markers are one-per-paper: <stem>.research-area
+      - '!papers/**/*.research-area'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: write   # needed for `gh workflow run` at the end of the job
+
+concurrency:
+  group: resolve-research-area
+  cancel-in-progress: false
+
+jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # A push may contain several commits covering several areas. Full
+          # history lets parse_area.py attribute each paper to its own commit.
+          fetch-depth: 0
+
+      - name: Sync with the latest main
+        run: |
+          git fetch origin main
+          git checkout -B ci-work origin/main
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Verify every PDF is committed with its BibTeX
+        # Read-only: lists the offending files and exits 1, with instructions to
+        # enable the hook and amend. No dependency install needed (no parsing).
+        run: python3 scripts/pdf_to_bib.py --check --fail
+
+      - name: Resolve research areas
+        env:
+          BASE_SHA: ${{ github.event.before }}
+        run: python3 scripts/parse_area.py
+
+      - name: Commit .research-area markers
+        id: commit
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add --all -- ':(glob)papers/**/*.research-area'
+
+          if git diff --cached --quiet; then
+            echo "Nothing to commit."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            git commit -m "[skip ci] chore: resolve research areas"
+            pushed=0
+            for attempt in 1 2 3; do
+              if git push origin HEAD:main; then pushed=1; break; fi
+              echo "push rejected (attempt $attempt); rebasing on latest main"
+              git fetch origin main
+              git rebase origin/main || { git rebase --abort; break; }
+              sleep 3
+            done
+            if [ "$pushed" -ne 1 ]; then
+              echo "::error::could not push the generated research-area markers"
+              exit 1
+            fi
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # A commit pushed with GITHUB_TOKEN does NOT trigger push-based workflows
+      # (GitHub's recursion guard). workflow_dispatch is an explicit exception,
+      # so we dispatch the README build here instead of relying on its push
+      # path filter. Without this step the README would never be regenerated.
+      - name: Trigger README rebuild
+        if: steps.commit.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh workflow run build-readme.yml --ref main

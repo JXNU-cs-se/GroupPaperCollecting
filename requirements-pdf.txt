@@ -1,0 +1,17 @@
+# Dependencies for scripts/pdf_to_bib.py ONLY. Needed by the LOCAL pre-commit
+# hook (.githooks/pre-commit) that generates a .bib before the commit is made,
+# and by manual local runs:
+#
+#     python3 -m pip install -r requirements-pdf.txt
+#
+# CI does NOT install this file: it only verifies that every PDF already has a
+# .bib, so no PDF parsing happens on the runner.
+#
+# Both entries are optional: without them the script falls back to `pdftotext`
+# (if installed) and finally to a clearly marked REVIEW stub, so a PDF is
+# never left without a .bib.
+pypdf>=4.0
+
+# Optional first-choice backend. Leave commented out if you prefer the
+# built-in DOI -> Crossref / arXiv lookups.
+# pdf2bib>=0.9

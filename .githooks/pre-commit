@@ -1,0 +1,96 @@
+#!/bin/sh
+# pre-commit: keep every PDF and its BibTeX in the SAME commit.
+#
+# A contributor who only stages papers/<user>/<stem>.pdf gets
+# papers/<user>/<stem>.bib generated on the spot and added to the index, so both
+# files land in that one commit. CI no longer generates BibTeX; it only verifies
+# this invariant and fails when a .bib is missing.
+#
+# Enable once per clone (hooks are local, not cloned automatically):
+#
+#     sh scripts/install_hooks.sh
+#
+# Behaviour:
+#   * only staged, added/modified/renamed PDFs are inspected;
+#   * an existing .bib (committed or already staged) is never regenerated;
+#   * generation needs network access for good metadata; without it a clearly
+#     marked REVIEW stub is written rather than blocking the commit;
+#   * if no .bib can be produced, the commit is aborted.
+set -eu
+
+root=$(git rev-parse --show-toplevel)
+cd "$root"
+
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "pre-commit: python3 is required to generate BibTeX." >&2
+  echo "pre-commit: install Python 3, or add the .bib manually and stage it." >&2
+  exit 1
+fi
+
+# --diff-filter=AMR: added, modified, renamed. quotePath=false keeps non-ASCII
+# and space-containing paths usable. Paths are newline separated; a filename
+# containing a literal newline is not supported (rare, and git itself mangles it).
+staged_pdfs=$(git -c core.quotePath=false diff --cached --name-only \
+  --diff-filter=AMR -- 'papers/' | grep -Ei '\.pdf$' || true)
+
+# `git commit --amend` stages nothing new, so the index matches HEAD and the
+# list above is empty. Include the PDFs of HEAD as well: when amending, HEAD is
+# the commit being rewritten, and its .bib must be produced now. This also
+# repairs a previous `--no-verify` commit on the next commit. In normal use the
+# HEAD PDFs already have their .bib, so this adds no work.
+committed_pdfs=$(git -c core.quotePath=false diff-tree --root --no-commit-id \
+  --name-only --diff-filter=AMR -r HEAD -- 'papers/' 2>/dev/null \
+  | grep -Ei '\.pdf$' || true)
+
+candidates=$(printf '%s\n%s\n' "$staged_pdfs" "$committed_pdfs" \
+  | sed '/^$/d' | sort -u)
+
+if [ -z "$candidates" ]; then
+  exit 0
+fi
+
+printf '%s\n' "$candidates" | while IFS= read -r pdf; do
+  [ -n "$pdf" ] || continue
+  bib="${pdf%.*}.bib"
+
+  # Already committed or already staged: nothing to do.
+  if git cat-file -e "HEAD:$bib" 2>/dev/null; then
+    continue
+  fi
+  if ! git diff --cached --quiet -- "$bib"; then
+    continue
+  fi
+
+  echo "pre-commit: $pdf has no staged BibTeX; generating $bib"
+  # Set PDF_TO_BIB_OFFLINE=1 to skip network lookups (fast, stub-only).
+  extra=""
+  if [ "${PDF_TO_BIB_OFFLINE:-}" = "1" ]; then
+    extra="--offline"
+  fi
+  # shellcheck disable=SC2086
+  if ! python3 scripts/pdf_to_bib.py "$pdf" --quiet $extra; then
+    echo "pre-commit: failed to generate $bib." >&2
+    echo "pre-commit: add it manually, stage it, and commit again." >&2
+    exit 1
+  fi
+  if [ ! -f "$bib" ]; then
+    echo "pre-commit: $bib was not created." >&2
+    echo "pre-commit: add it manually, stage it, and commit again." >&2
+    exit 1
+  fi
+  git add -- "$bib"
+done
+
+# Final assertion: the invariant must hold after the loop. This also catches a
+# generator that silently wrote nothing.
+printf '%s\n' "$candidates" | while IFS= read -r pdf; do
+  [ -n "$pdf" ] || continue
+  bib="${pdf%.*}.bib"
+  if git cat-file -e "HEAD:$bib" 2>/dev/null; then
+    continue
+  fi
+  if git diff --cached --quiet -- "$bib"; then
+    echo "pre-commit: $pdf still has no staged $bib; aborting the commit." >&2
+    exit 1
+  fi
+done

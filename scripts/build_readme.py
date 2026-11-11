@@ -1,12 +1,21 @@
 #!/usr/bin/env python3
 """Aggregate paper entries by research area and regenerate README.md.
 
-Runs in the "Build README" workflow whenever a ``.research-area`` marker is
-pushed, or when the workflow is dispatched by the "Resolve Research Area"
+Runs in the "Build README" workflow whenever a ``<stem>.research-area`` marker
+is pushed, or when the workflow is dispatched by the "Resolve Research Area"
 workflow (a GITHUB_TOKEN push cannot itself trigger another workflow).
+
+Layout: ``papers/<user>/<stem>.pdf`` + ``<stem>.bib`` + ``<stem>.research-area``.
+Files are matched by stem (the file name without its extension); file names may
+contain spaces, so PDF links are percent-encoded.
 
 The output is deterministic for a given set of inputs, so a no-op rebuild does
 not create a commit.
+
+BibTeX files written by ``scripts/pdf_to_bib.py`` start with an
+``%% AUTO-GENERATED`` header. Such entries get a visible「待核对」badge in the
+README; once a human fixes the metadata and removes the header the badge
+disappears on the next rebuild.
 
 ``bibtexparser`` is used when available; both the v1 (``loads``/``load``) and
 v2 (``parse_string``) APIs are supported. A small built-in parser is used as a
@@ -26,7 +35,13 @@ from urllib.parse import quote
 ROOT = Path(__file__).resolve().parent.parent
 PAPERS = ROOT / "papers"
 README = ROOT / "README.md"
-MARKER = ".research-area"
+MARKER_SUFFIX = ".research-area"
+PAPER_SUFFIXES = {".bib", ".pdf"}
+
+
+def marker_for(base: Path) -> Path:
+    return base.parent / (base.name + MARKER_SUFFIX)
+
 
 try:
     # Chinese area names are sorted by pinyin, which is what "alphabetical"
@@ -173,8 +188,10 @@ def parse_bib(path: Path) -> list[dict[str, str]]:
 # --------------------------------------------------------------------------
 
 def format_authors(raw: str) -> str:
-    if not raw:
-        return "未知作者"
+    # Stubs generated without metadata carry an obvious REVIEW placeholder;
+    # render it as a clear to-do instead of pretending "authors" is a surname.
+    if not raw or raw.strip().upper().startswith("REVIEW"):
+        return "待补作者"
     parts = [part.strip() for part in re.split(r"\s+and\s+", raw, flags=re.I) if part.strip()]
     if not parts:
         return "未知作者"
@@ -205,6 +222,7 @@ class Entry:
     year: int
     pdf: Path | None
     source: Path
+    needs_review: bool = False
 
     def render(self) -> str:
         title = md_escape(self.title)
@@ -218,7 +236,51 @@ class Entry:
                 file=sys.stderr,
             )
         year = str(self.year) if self.year else "n.d."
-        return f"- {title} — {self.authors} — {year}"
+        line = f"- {title} — {self.authors} — {year}"
+        if self.needs_review:
+            line += "（BibTeX 自动生成，待核对）"
+        return line
+
+
+# --------------------------------------------------------------------------
+# Fixed header: the commit message contract
+# --------------------------------------------------------------------------
+# This block is part of the generator on purpose. README.md is rebuilt from
+# scratch on every run, so a hand-written notice would be erased by the first
+# CI rebuild. Keeping it here makes the rule permanent and impossible to drift
+# away from what scripts/parse_area.py actually parses.
+
+COMMIT_CONVENTION = [
+    "## 提交前必读：commit 注释必须声明研究方向",
+    "",
+    "成员提交论文时，**commit 注释中必须写上 `[AREA: ...]`**，格式为：",
+    "",
+    "```text",
+    "该小节下的数字序号： <论文文件名> : [AREA: <研究方向>]  :  [贡献人 ： 项目成员的GitHub账号]",
+    "```",
+    "",
+    "典型示例（本条对应 `papers/lihongwei/` 下的 WeSCE，"
+    "`Intelligence Software Engineering` 小节的第 1 条）：",
+    "",
+    "```text",
+    "1： WeSCE A Benchmark for Measuring Security : [AREA: Intelligence Software Engineering]  :  [贡献人 ： lihongweimail]",
+    "```",
+    "",
+    "- `[AREA: ...]` 里的方向名会被写成该论文的 `<文件名>.research-area` 标记，"
+    "并作为下面每个小节的标题，请保持简短、稳定。",
+    "- 数字序号填该论文在所属方向小节里的顺序号（新提交取该小节当前条目数 + 1）；"
+    "`<论文文件名>` 与 `papers/<你的用户名>/` 下的文件名一致，不含扩展名。",
+    "- **一次 commit 只写一个方向**；不同方向的论文请分开提交，否则 CI 会判为冲突。",
+    "- 漏写 `[AREA: ...]` 时 CI 会**失败（红色 ✗）**，补正方式："
+    "`git add <论文> && git commit --amend --no-edit` 后重新 push。",
+    "- 论文与同名 `.bib` 必须在**同一个 commit** 中提交；首次 clone 后先执行 "
+    "`sh scripts/install_hooks.sh` 安装 pre-commit hook，缺 `.bib` 时会在提交前自动生成。",
+    "- **旧论文跳过、新论文照常归类**：若 commit 注释里写的是**已有论文**及其方向"
+    "（复制模板、顺带提及、或修改旧论文时又写一遍），这条声明会被**识别并忽略**——"
+    "那篇论文保持原小节，不会被移动，也不会重复出现在新方向里；"
+    "而**尚未归类的新论文**仍按原来的行为，直接写入 `[AREA: ...]` 对应的研究方向小节。",
+    "- 完整目录结构与贡献流程见 [CONTRIBUTING.md](CONTRIBUTING.md)。",
+]
 
 
 # --------------------------------------------------------------------------
@@ -232,10 +294,21 @@ def collect_entries() -> list[Entry]:
     for user_dir in sorted(PAPERS.iterdir()):
         if not user_dir.is_dir() or user_dir.name.startswith("."):
             continue
-        for bib_dir in sorted(user_dir.iterdir()):
-            if not bib_dir.is_dir() or bib_dir.name.startswith("."):
+
+        # Group files by stem: <stem>.pdf / <stem>.bib / <stem>.research-area
+        grouped: dict[Path, dict[str, list[Path]]] = {}
+        for file_path in sorted(user_dir.iterdir()):
+            if not file_path.is_file():
                 continue
-            marker = bib_dir / MARKER
+            suffix = file_path.suffix.lower()
+            if suffix not in PAPER_SUFFIXES:
+                continue
+            base = file_path.with_suffix("")
+            bucket = grouped.setdefault(base, {"bib": [], "pdf": []})
+            bucket["bib" if suffix == ".bib" else "pdf"].append(file_path)
+
+        for base in sorted(grouped):
+            marker = marker_for(base)
             if not marker.is_file():
                 continue
             area = " ".join(marker.read_text(encoding="utf-8").split())
@@ -246,29 +319,36 @@ def collect_entries() -> list[Entry]:
                 )
                 continue
 
-            bib_files = sorted(bib_dir.glob("*.bib"))
+            bib_files = grouped[base]["bib"]
             if not bib_files:
                 print(
-                    f"warning: no .bib in {bib_dir.relative_to(ROOT).as_posix()}, skipped",
+                    f"warning: {base.relative_to(ROOT).as_posix()}.pdf has no matching "
+                    ".bib; skipped (the Resolve Research Area workflow generates it, "
+                    "or run scripts/pdf_to_bib.py locally)",
                     file=sys.stderr,
                 )
                 continue
-            bib_path = (bib_dir / f"{bib_dir.name}.bib")
-            bib_path = bib_path if bib_path.is_file() else bib_files[0]
-
-            pdfs = sorted(bib_dir.glob("*.pdf"))
-            preferred = bib_dir / f"{bib_dir.name}.pdf"
-            pdf = preferred if preferred.is_file() else (pdfs[0] if pdfs else None)
+            bib_path = bib_files[0]
+            pdf_files = grouped[base]["pdf"]
+            pdf = pdf_files[0] if pdf_files else None
+            # The CI-generated header is the single source of truth for the
+            # "needs review" badge: fix the .bib, delete the header, rebuild.
+            bib_head = bib_path.read_text(encoding="utf-8", errors="replace")[:400]
+            # Only the header comment counts. A stub body may legitimately
+            # contain words like "metadata unavailable"; matching those would
+            # keep the badge alive after a human removed the header.
+            needs_review = "%% AUTO-GENERATED" in bib_head
 
             for record in parse_bib(bib_path):
                 entries.append(
                     Entry(
                         area=area,
-                        title=record.get("title") or record.get("citekey") or bib_dir.name,
+                        title=record.get("title") or record.get("citekey") or base.name,
                         authors=format_authors(record.get("author", "")),
                         year=parse_year(record.get("year", "")),
                         pdf=pdf,
-                        source=bib_dir,
+                        source=bib_path,
+                        needs_review=needs_review,
                     )
                 )
     return entries
@@ -282,7 +362,8 @@ def build_markdown(entries: list[Entry]) -> str:
         f"> 本文件由 GitHub Actions 自动生成，请勿手动编辑。最后更新于 {today}。",
         ">",
         "> A repository for students in our Group committing the reading Papers for Collecting.",
-        "> 按研究方向分节，节内按发表年份倒序排列；贡献方式见 [CONTRIBUTING.md](CONTRIBUTING.md)。",
+        "",
+        *COMMIT_CONVENTION,
         "",
     ]
 
