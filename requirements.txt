@@ -1,9 +1,8 @@
-# Only needed by scripts/build_readme.py. Both are optional: without them the
-# script falls back to its built-in BibTeX parser and code point sorting.
+# Used by scripts/build_readme.py; installed by the "Build README" workflow.
+# Both are optional for a local preview: without them the script falls back to
+# its built-in BibTeX parser and code point sorting.
 bibtexparser>=1.4,<3
 pypinyin>=0.49
 
-# scripts/pdf_to_bib.py has its own SEPARATE dependency file
-# (requirements-pdf.txt). That helper is a local, opt-in tool: CI must NOT
-# install it and no workflow may call it.
-
+# scripts/pdf_to_bib.py has its own dependency file (requirements-pdf.txt),
+# installed by the "Resolve Research Area and Missing BibTeX" workflow.

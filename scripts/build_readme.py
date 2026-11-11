@@ -12,6 +12,11 @@ contain spaces, so PDF links are percent-encoded.
 The output is deterministic for a given set of inputs, so a no-op rebuild does
 not create a commit.
 
+BibTeX files written by ``scripts/pdf_to_bib.py`` start with an
+``%% AUTO-GENERATED`` header. Such entries get a visible「待核对」badge in the
+README; once a human fixes the metadata and removes the header the badge
+disappears on the next rebuild.
+
 ``bibtexparser`` is used when available; both the v1 (``loads``/``load``) and
 v2 (``parse_string``) APIs are supported. A small built-in parser is used as a
 fallback so the aggregator still works in a bare environment (local preview,
@@ -183,8 +188,10 @@ def parse_bib(path: Path) -> list[dict[str, str]]:
 # --------------------------------------------------------------------------
 
 def format_authors(raw: str) -> str:
-    if not raw:
-        return "未知作者"
+    # Stubs generated without metadata carry an obvious REVIEW placeholder;
+    # render it as a clear to-do instead of pretending "authors" is a surname.
+    if not raw or raw.strip().upper().startswith("REVIEW"):
+        return "待补作者"
     parts = [part.strip() for part in re.split(r"\s+and\s+", raw, flags=re.I) if part.strip()]
     if not parts:
         return "未知作者"
@@ -215,6 +222,7 @@ class Entry:
     year: int
     pdf: Path | None
     source: Path
+    needs_review: bool = False
 
     def render(self) -> str:
         title = md_escape(self.title)
@@ -228,7 +236,10 @@ class Entry:
                 file=sys.stderr,
             )
         year = str(self.year) if self.year else "n.d."
-        return f"- {title} — {self.authors} — {year}"
+        line = f"- {title} — {self.authors} — {year}"
+        if self.needs_review:
+            line += "（BibTeX 自动生成，待核对）"
+        return line
 
 
 # --------------------------------------------------------------------------
@@ -271,13 +282,21 @@ def collect_entries() -> list[Entry]:
             if not bib_files:
                 print(
                     f"warning: {base.relative_to(ROOT).as_posix()}.pdf has no matching "
-                    ".bib; skipped (run scripts/pdf_to_bib.py locally, then review)",
+                    ".bib; skipped (the Resolve Research Area workflow generates it, "
+                    "or run scripts/pdf_to_bib.py locally)",
                     file=sys.stderr,
                 )
                 continue
             bib_path = bib_files[0]
             pdf_files = grouped[base]["pdf"]
             pdf = pdf_files[0] if pdf_files else None
+            # The CI-generated header is the single source of truth for the
+            # "needs review" badge: fix the .bib, delete the header, rebuild.
+            bib_head = bib_path.read_text(encoding="utf-8", errors="replace")[:400]
+            # Only the header comment counts. A stub body may legitimately
+            # contain words like "metadata unavailable"; matching those would
+            # keep the badge alive after a human removed the header.
+            needs_review = "%% AUTO-GENERATED" in bib_head
 
             for record in parse_bib(bib_path):
                 entries.append(
@@ -288,6 +307,7 @@ def collect_entries() -> list[Entry]:
                         year=parse_year(record.get("year", "")),
                         pdf=pdf,
                         source=bib_path,
+                        needs_review=needs_review,
                     )
                 )
     return entries
