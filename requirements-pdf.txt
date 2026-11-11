@@ -1,8 +1,11 @@
-# Dependencies for scripts/pdf_to_bib.py ONLY.
-# Installed automatically by .github/workflows/resolve-area.yml on every
-# papers/ push, and manually when you want to preview generation locally:
+# Dependencies for scripts/pdf_to_bib.py ONLY. Needed by the LOCAL pre-commit
+# hook (.githooks/pre-commit) that generates a .bib before the commit is made,
+# and by manual local runs:
 #
 #     python3 -m pip install -r requirements-pdf.txt
+#
+# CI does NOT install this file: it only verifies that every PDF already has a
+# .bib, so no PDF parsing happens on the runner.
 #
 # Both entries are optional: without them the script falls back to `pdftotext`
 # (if installed) and finally to a clearly marked REVIEW stub, so a PDF is

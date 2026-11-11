@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
-"""PDF -> BibTeX generator, used both locally and by CI.
+"""PDF -> BibTeX generator: used by the pre-commit hook and for local previews.
 
-CI integration
---------------
-The "Resolve Research Area" workflow runs this script with ``--ci`` on every
-push that touches ``papers/``. For each PDF that has no same-named ``.bib`` it
-writes ``<stem>.bib`` next to the PDF, reports the exact generated paths via
-``--list-generated``, and the workflow commits those files together with the
-``<stem>.research-area`` markers. This is what makes a PDF-only contribution
-complete: the contributor only has to commit the PDF.
+Where generation happens
+------------------------
+In the contributor's local pre-commit hook (``.githooks/pre-commit``). The hook
+calls this script with an explicit PDF path and ``--quiet``, then stages the
+``.bib`` itself, so a PDF and its BibTeX always land in the SAME commit.
 
-This script NEVER runs git itself. Staging / committing / pushing is entirely
-the workflow's job, so the generation step stays usable as a local tool.
+CI does **not** generate files any more. It only verifies the invariant:
+``pdf_to_bib.py --check --fail`` exits 1 when some PDF has no same-named
+``.bib``, which turns the "Resolve Research Area" workflow red and tells the
+contributor to enable the hook and amend the commit.
+
+This script NEVER runs git itself. Staging / committing / pushing is either the
+hook's job or yours.
 
 Quality contract
 ----------------
@@ -36,10 +38,11 @@ PDF never gets stuck without a .bib.
 Usage (from the repository root)
 --------------------------------
     python3 scripts/pdf_to_bib.py --check          # report PDFs lacking .bib, write nothing
+    python3 scripts/pdf_to_bib.py --check --fail   # CI gate: exit 1 when any .bib is missing
     python3 scripts/pdf_to_bib.py                 # local: generate drafts for all such PDFs
-    python3 scripts/pdf_to_bib.py papers/alice/attention.pdf
+    python3 scripts/pdf_to_bib.py papers/alice/attention.pdf --quiet
     python3 scripts/pdf_to_bib.py --offline       # no network calls; stubs only
-    python3 scripts/pdf_to_bib.py --ci --list-generated "$RUNNER_TEMP/bibs.txt"
+    python3 scripts/pdf_to_bib.py --ci --list-generated "$RUNNER_TEMP/bibs.txt"  # batch mode
 
 Optional dependencies
 ---------------------
@@ -497,18 +500,26 @@ def write_ci_outputs(
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Generate <stem>.bib for PDFs that have none (local tool + CI stage)."
+        description="Generate <stem>.bib for PDFs that have none (pre-commit hook + local tool)."
     )
     parser.add_argument("pdfs", nargs="*", help="PDF paths relative to the repository root")
     parser.add_argument("--check", action="store_true", help="only report PDFs missing a .bib")
+    parser.add_argument(
+        "--fail", action="store_true",
+        help="with --check: exit 1 when a PDF has no matching .bib (CI gate)",
+    )
     parser.add_argument("--offline", action="store_true", help="skip all network lookups")
     parser.add_argument(
+        "--quiet", action="store_true",
+        help="suppress the trailing review checklist (used by the pre-commit hook)",
+    )
+    parser.add_argument(
         "--ci", action="store_true",
-        help="CI mode: emit step outputs/summary instead of the local checklist",
+        help="batch mode: also emit GITHUB_OUTPUT / GITHUB_STEP_SUMMARY metadata",
     )
     parser.add_argument(
         "--list-generated", metavar="FILE",
-        help="write the generated .bib paths (one per line) for the workflow to stage",
+        help="batch mode: write the generated .bib paths, one per line",
     )
     args = parser.parse_args()
 
@@ -526,10 +537,20 @@ def main() -> int:
         print(f"{len(missing)} PDF(s) without a matching .bib:")
         for pdf in missing:
             print(f"  - {pdf.relative_to(ROOT).as_posix()}")
-        print("\nRun without --check to generate the missing .bib files.")
+        if args.fail:
+            print(
+                "\nERROR: every PDF must be committed together with a same-named .bib.\n"
+                "Enable the pre-commit hook once per clone:\n"
+                "    sh scripts/install_hooks.sh\n"
+                "then stage the PDF again and amend the commit:\n"
+                "    git add <the pdf> && git commit --amend --no-edit",
+                file=sys.stderr,
+            )
+        else:
+            print("\nRun without --check to generate the missing .bib files.")
         if args.ci:
             write_ci_outputs([], args.list_generated)
-        return 0
+        return 1 if args.fail else 0
 
     generated: list[tuple[str, str, bool]] = []
     for pdf in missing:
@@ -544,19 +565,21 @@ def main() -> int:
 
     if args.ci:
         write_ci_outputs(generated, args.list_generated)
-        print(
-            f"\nGenerated {len(generated)} .bib file(s); the workflow will commit "
-            "them together with the PDF and the research-area markers."
-        )
-    else:
+        if not args.quiet:
+            print(
+                f"\nGenerated {len(generated)} .bib file(s). Stage them with the PDF "
+                "so both land in the same commit."
+            )
+    elif not args.quiet:
         print(
             "\n" + "=" * 72 + "\n"
             "These .bib files carry an AUTO-GENERATED header: metadata is best-effort.\n"
             "  1. Verify title / author / year / cite key.\n"
             "  2. Delete the %% header lines to clear the README '待核对' badge.\n"
-            "  3. Commit the .bib with `git commit -m \"[AREA: <方向>] ...\"`.\n"
-            "CI already runs this script automatically (`--ci`) when you push a\n"
-            "PDF without a .bib. This local run never stages or commits anything.\n"
+            "  3. Stage the .bib together with the PDF so both share one commit:\n"
+            '       git add "<pdf>" "<bib>" && git commit -m "[AREA: <方向>] ..."\n'
+            "The pre-commit hook does step 3 for you when you stage only the PDF.\n"
+            "CI never generates or commits a .bib; it only verifies that one exists.\n"
             + "=" * 72
         )
     return 0

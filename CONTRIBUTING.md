@@ -1,9 +1,14 @@
 # 论文提交规范
 
-本仓库用 **commit message 声明研究方向**，由 GitHub Actions 自动补齐 `.bib` 与方向标记并生成 `README.md`。
+本仓库用 **commit message 声明研究方向**，由 GitHub Actions 自动写入方向标记并生成 `README.md`。
 成员只需放好文件、按格式提交，**不需要**（也不要）手动编辑 `README.md`，多人同时提交不会产生 Git 冲突。
 
-**最重要的简化：可以只提交 PDF。** 只要 commit message 写对 `[AREA: ...]`，CI 会自动生成同名 `.bib`、写方向标记、把它们补提交进仓库，并把论文收进 README（详见第三节）。
+**两条硬规则：**
+
+1. **先装一次 pre-commit hook**（每个 clone 一次）：`sh scripts/install_hooks.sh`
+2. **每篇论文的 PDF 与同名 `.bib` 必须在同一个 commit 里。** 只 `git add` PDF 就行，hook 会自动生成 `.bib` 并加入同一个 commit。
+
+CI 只负责**校验**这个约束并写方向标记，**不会**再补生成 BibTeX —— 因为 CI 在 push 之后才运行，补生成的 `.bib` 只能落在第二个 commit，破坏「同 commit」要求。
 
 ---
 
@@ -15,11 +20,11 @@
 papers/
 ├── alice/
 │   ├── smith2024attention.pdf
-│   ├── smith2024attention.bib                ← 可自己提供，也可由 CI 生成
+│   ├── smith2024attention.bib                ← 手写，或由 hook 生成
 │   ├── smith2024attention.research-area      ← CI 自动生成，不用管
-│   ├── vaswani2017attention.pdf             ← 只放 PDF 也可以
-│   ├── vaswani2017attention.bib              ← 由 CI 补上
-│   └── vaswani2017attention.research-area    ← 由 CI 补上
+│   ├── vaswani2017attention.pdf             ← 只 add 这个就够了
+│   ├── vaswani2017attention.bib              ← hook 自动生成并 add
+│   └── vaswani2017attention.research-area    ← CI 自动生成
 └── bob/
     ├── lee2025robust.pdf
     └── lee2025robust.bib
@@ -28,10 +33,10 @@ papers/
 规则：
 
 - **PDF 与 `.bib` 同名**（只有扩展名不同），例如 `smith2024attention.pdf` 配 `smith2024attention.bib`。脚本按「文件名去掉扩展名」关联二者。
-- 建议用简短的 cite key 作文件名（如 `smith2024attention`）。**允许文件名含空格**（如 `WeSCE A Benchmark for Measuring Security.pdf`），README 里的链接会自动做 URL 编码；但含空格的文件名在命令行操作时需要加引号。
+- 建议用简短的 cite key 作文件名（如 `smith2024attention`）。**允许文件名含空格**（如 `WeSCE A Benchmark for Measuring Security.pdf`），README 里的链接会自动做 URL 编码。
 - 一个 `.bib` 文件只放一条文献，必须包含 `title`、`author`、`year` 三个字段。
-- **推荐自己提供准确的 `.bib`**（Zotero 导出单条并人工核对）。如果只提交 PDF，第三节的自动生成流程会补一份**草稿**，准确性仍需你复核。
-- `<stem>.research-area` 是**自动生成的方向标记，一篇一个**，不要手动创建或编辑。不同成员永远不会修改同一个文件。
+- 推荐自己提供准确的 `.bib`（Zotero 导出单条并核对）；只提供 PDF 时 hook 会补一份**草稿**，准确性仍需你复核。
+- `<stem>.research-area` 是**自动生成的方向标记，一篇一个**，不要手动创建或编辑。
 - 每位成员只动自己的 `papers/<用户名>/` 目录，这是避免冲突的关键。
 
 ---
@@ -52,13 +57,11 @@ papers/
 ```
 
 ```bash
-# 同时提供 PDF 和手写 bib
-git add papers/alice/
-git commit -m "[AREA: 大模型推理优化] 添加 Smith 2024 论文"
-git push origin main
+# 一次性：启用仓库自带的 pre-commit hook
+sh scripts/install_hooks.sh
 
-# 或者：只提交 PDF，bib 由 CI 生成
-git add papers/alice/vaswani2017attention.pdf
+# 只 add PDF，hook 会自动生成 .bib 并加入同一个 commit
+git add "papers/alice/vaswani2017attention.pdf"
 git commit -m "[AREA: 大模型推理优化] 添加 Attention Is All You Need"
 git push origin main
 ```
@@ -68,94 +71,81 @@ git push origin main
 1. **一个 commit 只对应一个研究方向。** 一次要提交多篇不同方向的论文，请拆成多个 commit（分别 `git add` + `git commit`，最后一次性 `git push`）。同一方向的多篇可以放在一个 commit 里。
 2. 同一条 commit 里**只能出现一个方向名**；写了两个不同 `[AREA: ...]` 会被判定归属不明，CI 直接标红。
 3. **方向名称尽量简短、稳定。** 本系统不做近义词归一化：`大模型推理` 与 `LLM 推理优化` 会生成两个独立小节。首次使用新方向前建议先在团队群里确认用词。
+4. **不要用 `--no-verify` 跳过 hook**，否则 PDF 会缺 `.bib`，CI 必然标红。
 
 ### 提交后自动发生什么
 
-1. `Resolve Research Area and Missing BibTeX` 工作流同步最新 `main`，扫描所有**缺同名 `.bib` 的 PDF**，用 `scripts/pdf_to_bib.py --ci` 生成 `<stem>.bib`。
-2. `scripts/parse_area.py` 从**引入该论文的那条 commit message** 读取 `[AREA: ...]`，写入 `<stem>.research-area`。
-3. 工作流把本次生成的 `.bib` 与 `.research-area` **一次性补提交**（`[skip ci] chore: generate BibTeX and resolve research areas`）。
-4. 工作流通过 `workflow_dispatch` 触发 `Build README`：按方向分节、节内按 `year` 倒序，生成含 PDF 链接的清单，覆盖写入 `README.md`。
-
-> **平台限制说明**：GitHub Actions 只能在 push **之后**运行，因此自动生成的 `.bib` 无法塞进你那条已推送的 commit，它会落在紧随其后的**一个** bot commit 里（与方向标记一起）。从成员视角看，仍然是「一次 push 就把论文收进仓库」。若确实需要 PDF 与 `.bib` 处于同一个 commit，只能改用本地 pre-commit hook 在提交前生成，那不属于本仓库的 CI 流程。
+1. **本地**：pre-commit hook 发现暂存区里的 PDF 没有同名 `.bib`，调用 `scripts/pdf_to_bib.py` 生成 `<stem>.bib` 并 `git add`，于是 PDF 与 `.bib` 一起进入这次 commit。
+2. **远端**：`Resolve Research Area` 工作流先校验「每篇 PDF 都有 `.bib`」，再从**引入该论文的那条 commit message** 读取 `[AREA: ...]`，写入 `<stem>.research-area`，并补一个带 `[skip ci]` 的 bot commit（只含标记文件）。
+3. 随后通过 `workflow_dispatch` 触发 `Build README`：按方向分节、节内按 `year` 倒序，生成含 PDF 链接的清单，覆盖写入 `README.md`。
 
 ---
 
-## 三、只提交 PDF：CI 自动生成 BibTeX 并一同提交
+## 三、pre-commit hook：保证 PDF 与 BibTeX 同 commit
 
-### 触发条件
-
-`papers/` 下有变更，且其中存在**没有同名 `.bib` 的 PDF**。commit message 仍必须写 `[AREA: ...]`——方向声明是归类到正确小节的前提。
-
-### 生成流程与元数据来源
-
-工作流 `resolve-area.yml` 会安装 `requirements-pdf.txt`，然后运行：
+### 安装（每个 clone 一次）
 
 ```bash
-python3 scripts/pdf_to_bib.py --ci --list-generated "$RUNNER_TEMP/generated-bibs.txt"
+sh scripts/install_hooks.sh
 ```
 
-脚本按以下顺序尝试获取元数据，任一步失败都会自动降级，绝不因网络或依赖问题让 PDF 卡住：
+它做三件事：给 `.githooks/pre-commit` 加执行权限、设置 `git config core.hooksPath .githooks`、检查 Python 与可选依赖。hook 是本地配置，**不会随 clone 自动生效**，换机器或重新 clone 后要再跑一次。
 
-1. `pdf2bib`（若安装，默认未启用）
-2. PDF 正文里的 DOI → Crossref
-3. PDF 正文里的 arXiv ID → arXiv Atom API
-4. 首页推测标题 → Crossref 检索（相似度阈值严格，避免匹配到无关文献）
-5. 仍失败则生成带明显 `REVIEW:` 占位值的 `@misc` 条目
+如需 PDF 文本提取（元数据更准），再装一次可选依赖：
 
-生成的 `.bib` 与 PDF 同名、同目录，且与方向标记一起被工作流补提交。脚本本身**不执行** `git add` / `commit` / `push`。
+```bash
+python3 -m pip install -r requirements-pdf.txt
+```
 
-### 生成结果长什么样
+没有它 hook 仍能工作，只是更容易生成占位条目。
+
+### hook 的行为
+
+| 场景 | 行为 |
+| --- | --- |
+| 暂存了新 PDF，没有同名 `.bib` | 生成 `.bib` 并 `git add`，两者进入同一个 commit |
+| 暂存了新 PDF，`.bib` 已在工作区但没 add | 直接把该 `.bib` add 进来 |
+| `.bib` 已在仓库或已在暂存区 | 不重新生成，绝不覆盖 |
+| 只改了已有 PDF（同名 `.bib` 已存在） | 不动作 |
+| 生成失败 / 找不到 Python | **中止 commit**，提示手工补 `.bib` |
+
+只处理 `papers/` 下已暂存的 PDF，未暂存的其他 PDF 不受影响；文件名含空格、中文都能正确处理。
+
+### 元数据来源与质量
+
+按顺序尝试：`pdf2bib`（若装）→ PDF 内 DOI 查 Crossref → arXiv ID 查 arXiv → 首页标题检索 Crossref → 明显的 `REVIEW` 占位条目。网络不通不会卡住提交。
+
+生成的 `.bib` 顶部有：
 
 ```text
 %% AUTO-GENERATED by scripts/pdf_to_bib.py -- METADATA NEEDS HUMAN REVIEW
 %% Metadata source: Crossref DOI 10.1038/nature14539
 %% Source PDF: papers/alice/vaswani2017attention.pdf
-%% Generated by the 'Resolve Research Area' workflow and committed with the PDF.
-%% Verify title / author / year / cite key with a follow-up commit, then
-%% delete these %% lines to remove the '待核对' badge in README.md.
-
-@article{...}
+...
 ```
 
-`build_readme.py` 会识别文件头的 `AUTO-GENERATED`，在 README 对应条目后加 **（BibTeX 自动生成，待核对）**。这不是阻止提交，而是一个可见的质量提示。
+`build_readme.py` 识别这个头，在 README 条目后加 **（BibTeX 自动生成，待核对）**。**建议尽快**核对 `title` / `author` / `year` / cite key，删掉头部的 `%%` 行，再提交一次修正；标记随之消失。占位条目的作者会显示「待补作者」、年份 `n.d.`，看到就说明必须人工补全。
 
-### 建议的复核动作（不强制，但强烈建议）
-
-自动提取的元数据可能出错，尤其标题检索与占位条目。请尽快：
-
-1. 打开自动生成的 `.bib`，核对 `title` / `author` / `year` / cite key；
-2. 删除文件头的 `%%` 注释行；
-3. 正常提交这次修正（不必再写 `[AREA: ...]`，方向标记已存在）：
+### 手动等价操作（不想装 hook 时）
 
 ```bash
-git add papers/alice/vaswani2017attention.bib
-git commit -m "docs: 核对并修正自动生成的两条文献元数据"
-git push origin main
+python3 scripts/pdf_to_bib.py "papers/alice/attention.pdf"
+# 核对、必要时修改生成的 .bib
+git add "papers/alice/attention.pdf" "papers/alice/attention.bib"
+git commit -m "[AREA: 大模型推理优化] 添加 Attention Is All You Need"
 ```
 
-`.bib` 变更会触发 `Build README` 重建，「待核对」标记随之消失。若看到 `REVIEW: fill in the ...`、`0000` 或 `未知作者`，说明只生成了占位条目，**务必补正**。
+关键只有一条：**PDF 和 `.bib` 必须出现在同一次 `git add` + `git commit` 里。**
 
-### 本地手动运行（可选）
+### 网页上传不支持自动生成
+
+在 GitHub 网页上 `Add file → Upload files` 无法运行本地 hook，因此**会缺 `.bib`**。CI 会直接标红。论文请走本地 `git add` + `git commit` 的方式提交。
+
+### 关闭 hook
 
 ```bash
-python3 -m pip install -r requirements-pdf.txt
-
-python3 scripts/pdf_to_bib.py --check       # 只列出缺 .bib 的 PDF，不写文件
-python3 scripts/pdf_to_bib.py               # 本地生成草稿（不提交，需自己 git add）
-python3 scripts/pdf_to_bib.py --offline     # 不联网，只生成占位条目
-python3 scripts/pdf_to_bib.py papers/alice/attention.pdf
+git config --unset core.hooksPath
 ```
-
-本地运行时同样会写 `AUTO-GENERATED` 头；若你已核对完毕，删掉头注释再提交即可，README 不会显示「待核对」。
-
-### 两个工作流的分工
-
-| 工作流 | 对辅助脚本的使用 | 职责 |
-| --- | --- | --- |
-| `resolve-area.yml` | `pdf_to_bib.py --ci` | **生成** `.bib` 并与方向标记一起补提交 |
-| `build-readme.yml` | `pdf_to_bib.py --check`（只读巡检） | **消费**结果、重建 README；若发现仍有 PDF 缺 `.bib` 会在日志里报告 |
-
-生成动作只放在 `resolve-area.yml`：它才是负责 `git add` / `push` 的工作流。`build-readme.yml` 只暂存 `README.md`，若在其中生成文件会留下未提交的孤儿 `.bib`，造成索引与仓库不一致。
 
 ---
 
@@ -163,23 +153,43 @@ python3 scripts/pdf_to_bib.py papers/alice/attention.pdf
 
 | 现象 | 原因 | 处理 |
 | --- | --- | --- |
-| `Resolve Research Area and Missing BibTeX` 失败，日志有 `no [AREA: ...] found` | commit message 漏写方向声明 | 按下方「补救方式」补一次提交；bib 会在重跑时一并生成 |
+| `Resolve Research Area` 失败，日志有 `without a matching .bib` | 有 PDF 没配同名 `.bib`（常见于网页上传或用了 `--no-verify`） | 装 hook，本地补齐 `.bib` 后 amend（见下） |
+| 日志有 `no [AREA: ...] found` | commit message 漏写方向声明 | 按下方「补救方式」补一次提交 |
 | 日志有 `conflicting areas` | 一条 commit 写了两个不同方向 | 拆成两个 commit，各自声明一个方向 |
-| PDF 已提交但 README 没有该条目 | 方向标记未生成，或 `[AREA: ...]` 缺失导致工作流失败 | 先看 Actions 日志；补一次带方向声明的提交 |
-| README 条目带「（BibTeX 自动生成，待核对）」 | `.bib` 由 CI 生成 | 核对元数据、删掉文件头 `%%` 行、重新提交 |
-| README 显示 `REVIEW: ...` / `0000` / `未知作者` | 只生成了占位条目 | 手工补全 `.bib` 的 `title` / `author` / `year` |
-| README 显示 `n.d.` 或 `未知作者` | `.bib` 缺 `year` / `author` | 补全 `.bib` 后重新提交 |
-| README 出现两个意思相近的小节 | 方向名用词不一致 | 统一用词，修改对应 `<stem>.research-area` 并提交（会触发重建） |
+| README 条目带「（BibTeX 自动生成，待核对）」 | `.bib` 由 hook 生成 | 核对元数据、删掉文件头 `%%` 行、重新提交 |
+| README 显示「待补作者」/ `n.d.` | 只生成了占位条目 | 手工补全 `.bib` 的 `title` / `author` / `year` |
+| README 出现两个意思相近的小节 | 方向名用词不一致 | 统一用词，修改对应 `<stem>.research-area` 并提交 |
 
-**补救方式（漏写 `[AREA: ...]`）**：改动一下该论文对应的 `.bib`（补个注释也行），再以正确格式提交：
+### 补救：缺 `.bib`
+
+**还没 push**：
 
 ```bash
-git add papers/alice/smith2024attention.bib
+git add "papers/alice/attention.pdf"      # hook 会生成并 add .bib
+git commit --amend --no-edit
+```
+
+**已经 push、CI 已标红**（要保持严格同 commit 只能改写历史）：
+
+```bash
+git add "papers/alice/attention.pdf"
+git commit --amend --no-edit              # 把 .bib 并入原 commit
+git push --force-with-lease origin main   # 操作前确认没有别人的新提交
+```
+
+`main` 没有分支保护，force push 会改写远端历史。执行前先 `git fetch` 看一眼，确认这条 commit 之后没有其他人的提交。
+
+### 补救：漏写 `[AREA: ...]`
+
+改动一下该论文对应的 `.bib`（补个注释也行），再以正确格式提交：
+
+```bash
+git add "papers/alice/smith2024attention.bib"
 git commit -m "[AREA: 大模型推理优化] 补充研究方向声明"
 git push origin main
 ```
 
-也可以在仓库 **Actions** 页手动运行 `Resolve Research Area and Missing BibTeX`。注意：**空 commit（`--allow-empty`）不会触发工作流**，因为 push 的路径过滤要求确实有 `papers/` 下的文件变更。
+也可以在仓库 **Actions** 页手动运行 `Resolve Research Area`。注意：**空 commit（`--allow-empty`）不会触发工作流**，因为 push 的路径过滤要求确实有 `papers/` 下的文件变更。
 
 ---
 
@@ -197,7 +207,8 @@ python3 scripts/build_readme.py    # 生成 README.md
 
 ## 六、范围说明
 
-- CI **会**为「只有 PDF」的提交自动生成并补交 `.bib`，但**不保证**元数据正确；生成结果带 `AUTO-GENERATED` 头并在 README 标注「待核对」，最终准确性仍由提交者负责。
+- **「PDF 与 `.bib` 同 commit」由本地 pre-commit hook 保证。** CI 只校验、不生成：`pdf_to_bib.py --check --fail` 会在任何 PDF 缺 `.bib` 时让工作流失败。
+- 自动生成的 BibTeX 只是草稿，**准确性由提交者负责**；README 会标注「待核对」，删掉 `.bib` 头部注释后标记消失。
 - 方向名称不做自动归一，避免误判；如后续确有需要，可在 `build_readme.py` 中增加可选的别名映射表。
 - `README.md` 由自动化维护，请勿手动编辑。
-- 两个自动化提交都带 `[skip ci]`，且由 `GITHUB_TOKEN` 推送（GitHub 不会再触发 push 型工作流），因此不会循环构建；README 的重建由 `workflow_dispatch` 显式触发。
+- bot 提交带 `[skip ci]`，且由 `GITHUB_TOKEN` 推送（GitHub 不会因此触发 push 型工作流），README 的重建由 `workflow_dispatch` 显式触发，不会循环构建。
