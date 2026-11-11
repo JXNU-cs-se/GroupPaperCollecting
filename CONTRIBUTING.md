@@ -43,18 +43,25 @@ papers/
 
 ## 二、提交：commit message 声明研究方向
 
-**commit message 固定格式**：
+**commit message 固定格式**（`[AREA: ...]` 必须写，前面的论文标题建议写上）：
 
 ```text
-[AREA: <研究方向名称>] 简短描述
+<论文标题> : [AREA: <研究方向名称>]
 ```
 
-示例：
+典型示例：
+
+```text
+WeSCE A Benchmark for Measuring Security : [AREA: Intelligence Software Engineering]
+```
+
+也可以只写方向加简短描述：
 
 ```text
 [AREA: 大模型推理优化] 添加 Smith 2024 关于 KV Cache 压缩的工作
-[AREA: 图神经网络] 添加 Lee 2025 鲁棒性分析
 ```
+
+两种写法等价：解析器只取方括号里的内容，前面的文字不影响归属。`[ AREA: … ]`、全角 `【AREA：…】` 也能识别。这段规范同时固定显示在 `README.md` 顶部。
 
 ```bash
 # 一次性：启用仓库自带的 pre-commit hook

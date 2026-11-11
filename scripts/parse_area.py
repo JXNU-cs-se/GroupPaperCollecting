@@ -15,8 +15,10 @@ never touch the same path. File names may contain spaces.
 
 Contract
 --------
-* The contributor declares the area in the commit message:
-  ``[AREA: <name>] <short description>``.
+* The contributor declares the area in the commit message. The documented
+  template is ``<paper title> : [AREA: <area>]``, e.g.
+  ``WeSCE A Benchmark for Measuring Security : [AREA: Intelligence Software Engineering]``.
+  Only the bracketed part is parsed, so a leading description is harmless.
 * For every paper stem that has a ``.pdf`` and/or ``.bib`` but no marker yet,
   this script writes the area name into ``<stem>.research-area``.
 * If any such stem cannot be assigned an unambiguous area, the script exits
@@ -54,7 +56,12 @@ PAPERS = ROOT / "papers"
 MARKER_SUFFIX = ".research-area"
 PAPER_SUFFIXES = {".bib", ".pdf"}
 
-AREA_RE = re.compile(r"\[AREA\s*:\s*([^\]\r\n]+?)\s*\]", re.IGNORECASE)
+# Tolerant on purpose: contributors type "[AREA: x]", "[ AREA: x ]" and the
+# full-width "【AREA：x】" their input method produces. All mean the same thing.
+AREA_RE = re.compile(
+    r"[\[【]\s*AREA\s*[:：]\s*([^\]】\r\n]+?)\s*[\]】]",
+    re.IGNORECASE,
+)
 # papers/<user>/<file>
 PAPER_PATH_RE = re.compile(r"^papers/([^/]+)/(.+)$")
 
