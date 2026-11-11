@@ -1,0 +1,14 @@
+# Dependencies for scripts/pdf_to_bib.py ONLY.
+# This is a local, opt-in helper. CI does NOT install this file and no workflow
+# calls the script. Install it manually when you want to generate draft .bib
+# files from PDFs:
+#
+#     python3 -m pip install -r requirements-pdf.txt
+#
+# Both entries are optional: without them the script falls back to `pdftotext`
+# (if installed) and finally to a clearly marked review stub.
+pypdf>=4.0
+
+# Optional first-choice backend. Leave commented out if you prefer the
+# built-in DOI -> Crossref / arXiv lookups.
+# pdf2bib>=0.9
