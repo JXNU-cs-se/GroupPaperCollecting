@@ -1,7 +1,20 @@
 #!/usr/bin/env python3
-"""Resolve research areas for newly added papers.
+"""Resolve research areas for newly added papers — the CI fallback.
 
-Runs in the "Resolve Research Area" workflow on every push that touches papers/.
+The normal path is ``.githooks/commit-msg`` + ``.githooks/pre-commit``: the
+contributor's own clone validates the message, generates the BibTeX, writes the
+marker and rebuilds README.md **inside the commit being created**. This script
+only runs for contributors who did not install the hooks (paper uploaded
+through the web UI, or a ``--no-verify`` commit). It performs the same steps on
+the GitHub runner:
+
+1. reads the ``[AREA: ...]`` / ``[贡献人 ： ...]`` declaration from the commit
+   message that introduced each paper;
+2. writes ``papers/<user>/<stem>.research-area`` (JSON: area, seq,
+   contributor, date);
+3. rebuilds README.md and stages it together with the markers, so the workflow
+   commits marker + README in **one** commit — the index is correct as soon as
+   the push finishes, not one commit later.
 
 Layout
 ------
@@ -15,153 +28,63 @@ never touch the same path. File names may contain spaces.
 
 Contract
 --------
-* The contributor declares the area in the commit message. The documented
-  template is ``<n>： <paper file name> : [AREA: <area>]  :  [贡献人 ： <gh account>]``,
-  e.g. ``1： WeSCE A Benchmark for Measuring Security : [AREA: Intelligence Software Engineering]``.
-  Only the bracketed ``[AREA: ...]`` is parsed; the position number, the
-  trailing contributor field and any other prose are ignored.
+* The contributor declares the area, number and GitHub account in the commit
+  message: ``<n>： <paper file name> : [AREA: <area>]  :  [贡献人 ： <account>]``.
+  :mod:`commit_contract` is the single parser/validator for that format, shared
+  with the local hooks, so both sides always agree.
 * For every paper stem that has a ``.pdf`` and/or ``.bib`` but no marker yet,
-  this script writes the area name into ``<stem>.research-area``.
+  this script writes ``<stem>.research-area``.
 * If any such stem cannot be assigned an unambiguous area, the script exits
   with status 1 so the workflow turns red and the contributor is told to fix
   the commit message. Silent skipping would quietly corrupt the index.
 
 Attribution rules (in order)
 ----------------------------
-0. A declaration that names an ALREADY categorised paper (template
-   ``<title> : [AREA: ...]``) is **ignored**: the paper keeps its existing
-   marker, is never moved to another section, and the declaration is not
-   inherited by a newly added paper. This is reported in the step summary.
-   A NEW (not yet categorised) paper is unaffected: its declaration is applied
-   and the paper is written into that area's section, as before.
+0. A declaration that names an ALREADY categorised paper is **ignored**: the
+   paper keeps its existing marker, is never moved to another section, and the
+   declaration is not inherited by a newly added paper. This is reported in the
+   step summary. A NEW (not yet categorised) paper is unaffected: its
+   declaration is applied and the paper is written into that area's section.
 1. For a paper introduced by one of the commits in this push, use the
-   ``[AREA: ...]`` value from *that specific commit*. This allows one push to
-   contain several commits covering several different areas, as long as each
-   commit declares exactly one area.
+   declaration from *that specific commit*. This allows one push to contain
+   several commits covering several different areas, as long as each commit
+   declares exactly one area.
 2. Otherwise (e.g. a repair commit after a missing ``[AREA: ...]``), use the
    area declared anywhere in this push, provided all declarations agree.
 
 Environment
 -----------
-``BASE_SHA``      Commit sha before this push (``github.event.before``). If it
-                  is absent or all zeroes, ``HEAD^`` is used instead.
-``PUSH_COMMITS``  Optional space separated sha list, for local testing.
-
+``BASE_SHA``        Commit sha before this push (``github.event.before``). If it
+                    is absent or all zeroes, ``HEAD^`` is used instead.
+``PUSH_COMMITS``    Optional space separated sha list, for local testing.
+``GITHUB_ACTIONS``  When set, the rebuilt README.md is staged so the workflow's
+                    commit picks it up.
 ``GITHUB_STEP_SUMMARY`` is written when present.
 """
 
 from __future__ import annotations
 
-import difflib
 import os
 import re
 import subprocess
 import sys
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent.parent
-PAPERS = ROOT / "papers"
-MARKER_SUFFIX = ".research-area"
-PAPER_SUFFIXES = {".bib", ".pdf"}
-
-# Tolerant on purpose: contributors type "[AREA: x]", "[ AREA: x ]" and the
-# full-width "【AREA：x】" their input method produces. All mean the same thing.
-AREA_RE = re.compile(
-    r"[\[【]\s*AREA\s*[:：]\s*([^\]】\r\n]+?)\s*[\]】]",
-    re.IGNORECASE,
+import build_readme
+from commit_contract import Declaration, declarations_in, help_text
+from paper_index import (
+    PAPER_SUFFIXES,
+    ROOT,
+    marker_for,
+    paper_bases,
+    read_marker,
+    title_matches_paper,
+    write_marker,
 )
-# papers/<user>/<file>
-PAPER_PATH_RE = re.compile(r"^papers/([^/]+)/(.+)$")
-BIB_TITLE_RE = re.compile(r"\btitle\s*=\s*[{\"](.+?)[}\"]\s*,", re.IGNORECASE | re.DOTALL)
 
-
-def marker_for(base: Path) -> Path:
-    """Marker path for a stem path (a Path with no extension)."""
-    return base.parent / (base.name + MARKER_SUFFIX)
-
-
-# --------------------------------------------------------------------------
-# Commit message declarations
-# --------------------------------------------------------------------------
-
-def declarations_in(message: str) -> list[tuple[str, str]]:
-    """Return ``(area, paper_title)`` pairs declared in a commit message.
-
-    The documented template is ``<paper title> : [AREA: <area>]``, so the text
-    between the start of the bracket's line and the bracket itself is treated
-    as a *reference to a paper* only when it ends with a colon. Anything else
-    (``[AREA: x] add Smith 2024``, ``docs: 说明 [AREA: ...] 的用法``) is prose
-    and yields an empty title.
-
-    ``paper_title`` matters because a member may legitimately mention an
-    already-categorised paper in the same commit message (copying the template,
-    a "see also" note, or re-touching that paper). Such a declaration must not
-    be applied to the new paper, and must not move the old one.
-    """
-    declarations: list[tuple[str, str]] = []
-    for match in AREA_RE.finditer(message):
-        area = " ".join(match.group(1).split())
-        if not area:
-            continue
-        line_start = message.rfind("\n", 0, match.start()) + 1
-        prefix = message[line_start:match.start()].strip()
-        title = ""
-        if prefix.endswith((":", "：")):
-            candidate = prefix[:-1].strip(" \t-—–·*#>")
-            # The documented template prefixes the file name with the paper's
-            # position in its section ("1： WeSCE …"). That number is not part
-            # of the title, so drop it (with its separator) before matching.
-            # A leading digit without a separator ("3D Gaussian Splatting") is
-            # part of the title and must survive.
-            candidate = re.sub(r"^\d+\s*[:：.、]\s*", "", candidate).strip()
-            # Guard against a long prose line that merely happens to end with
-            # a colon, and against a previously parsed "[AREA: ...]" fragment.
-            if candidate and len(candidate) <= 200 and "[" not in candidate:
-                title = candidate
-        declarations.append((area, title))
-    return declarations
-
-
-def norm_text(text: str) -> str:
-    """Letters/digits/CJK only, lowercased: 'WeSCE: A Benchmark' -> 'wesceabenchmark'."""
-    return re.sub(r"[^0-9a-z\u4e00-\u9fff]+", "", text.lower())
-
-
-def bib_title(bib_path: Path) -> str:
-    try:
-        head = bib_path.read_text(encoding="utf-8", errors="replace")[:4000]
-    except OSError:
-        return ""
-    match = BIB_TITLE_RE.search(head)
-    if not match:
-        return ""
-    raw = re.sub(r"\\(?:emph|textbf|textit)\{([^{}]*)\}", r"\1", match.group(1))
-    return " ".join(raw.replace("{", "").replace("}", "").split())
-
-
-def title_matches_paper(title: str, base: Path) -> bool:
-    """Does ``title`` refer to the paper at ``base``?
-
-    Compared against the file stem and the BibTeX title, both normalised, so
-    "WeSCE A Benchmark for Measuring Security" matches a file of that name as
-    well as the fuller title stored in its .bib.
-    """
-    needle = norm_text(title)
-    if not needle:
-        return False
-    keys = [norm_text(base.name), norm_text(bib_title(base.with_suffix(".bib")))]
-    for key in keys:
-        if not key:
-            continue
-        if needle == key:
-            return True
-        # A contributor often types an abbreviated title ("WeSCE A Benchmark
-        # for Measuring Security" vs. the full published title).
-        if len(needle) >= 12 and (needle in key or key in needle):
-            return True
-        if difflib.SequenceMatcher(None, needle, key).ratio() >= 0.86:
-            return True
-    return False
+# papers/<user>/<file> — the layout is flat, so a nested directory is not a
+# paper entry (leftovers of the old per-paper-subdirectory layout are ignored).
+PAPER_PATH_RE = re.compile(r"^papers/([^/]+)/([^/]+)$")
 
 
 def git(*args: str, check: bool = True) -> str:
@@ -237,7 +160,7 @@ def introduced_bases(commits: list[str]) -> dict[Path, str]:
 def touched_bases(commits: list[str]) -> dict[Path, str]:
     """Map a stem touched (added OR modified) in this push -> last commit sha.
 
-    Used for repair commits: a contributor who forgot ``[AREA: ...]`` can edit
+    Used for repair commits: a contributor who forgot the declaration can edit
     the .bib and re-commit. Papers that were NOT touched by this push are never
     assigned an area from somebody else's commit message.
     """
@@ -257,42 +180,22 @@ def touched_bases(commits: list[str]) -> dict[Path, str]:
     return result
 
 
-def paper_bases() -> list[Path]:
-    """All stems (paths without extension) that look like a paper entry."""
-    if not PAPERS.is_dir():
-        return []
-    found: set[Path] = set()
-    for user_dir in PAPERS.iterdir():
-        if not user_dir.is_dir() or user_dir.name.startswith("."):
-            continue
-        for file_path in user_dir.iterdir():
-            if file_path.is_file() and file_path.suffix.lower() in PAPER_SUFFIXES:
-                found.add(file_path.with_suffix(""))
-    return sorted(found)
-
-
-def areas_in(message: str) -> list[str]:
-    """Unique, non-empty area names declared in a commit message, in order."""
-    seen: list[str] = []
-    for area, _title in declarations_in(message):
-        if area not in seen:
-            seen.append(area)
-    return seen
-
-
-def read_marker(base: Path) -> str:
-    try:
-        return " ".join(marker_for(base).read_text(encoding="utf-8").split())
-    except OSError:
-        return ""
-
-
 def emit_outputs(lines: list[str]) -> None:
     summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
     if summary_path:
         with open(summary_path, "a", encoding="utf-8") as handle:
             handle.write("### Resolve Research Area\n\n")
             handle.write("\n".join(f"- {line}" for line in lines) + "\n")
+
+
+def stage(paths: list[str]) -> None:
+    if not paths:
+        return
+    result = subprocess.run(
+        ["git", "add", "--", *paths], cwd=ROOT, capture_output=True, text=True
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"git add failed: {result.stderr.strip()}")
 
 
 def main() -> int:
@@ -303,7 +206,7 @@ def main() -> int:
     touched = touched_bases(commits)
 
     bases = paper_bases()
-    existing = {base: read_marker(base) for base in bases if marker_for(base).is_file()}
+    existing = {base: marker for base in bases if (marker := read_marker(base)) is not None}
     unmarked = [base for base in bases if base not in existing]
 
     # A commit message may mention an ALREADY categorised paper together with
@@ -311,33 +214,36 @@ def main() -> int:
     # that paper). Those declarations are ignored: they must never move the
     # paper into another section, and they must not be inherited by a new paper
     # committed at the same time.
-    usable: dict[str, list[str]] = {}
+    usable: dict[str, list[Declaration]] = {}
     ignored: list[str] = []
     for sha, message in messages.items():
-        for area, title in declarations_in(message):
-            if title:
+        for declaration in declarations_in(message):
+            if declaration.paper:
                 owner = next(
-                    (base for base in existing if title_matches_paper(title, base)),
+                    (base for base in existing if title_matches_paper(declaration.paper, base)),
                     None,
                 )
                 if owner is not None:
-                    kept = existing[owner]
+                    kept = existing[owner].area
                     reason = (
-                        "方向与现有标记一致" if kept == area else f"现有方向为 **{kept}**"
+                        "方向与现有标记一致" if kept == declaration.area
+                        else f"现有方向为 **{kept}**"
                     )
                     ignored.append(
-                        f"`{owner.name}` — 已有方向，忽略本次声明 `{area}`（{reason}）"
+                        f"`{owner.name}` — 已有方向，忽略本次声明 `{declaration.area}`（{reason}）"
                     )
                     continue
             bucket = usable.setdefault(sha, [])
-            if area not in bucket:
-                bucket.append(area)
+            if all(item.area != declaration.area for item in bucket):
+                bucket.append(declaration)
 
     all_areas: list[str] = []
+    all_declarations: list[Declaration] = []
     for sha in commits:
-        for area in usable.get(sha, []):
-            if area not in all_areas:
-                all_areas.append(area)
+        for declaration in usable.get(sha, []):
+            if declaration.area not in all_areas:
+                all_areas.append(declaration.area)
+            all_declarations.append(declaration)
 
     # Only papers this push actually touched are in scope. Older unmarked
     # papers must NOT inherit an area from somebody else's commit message.
@@ -350,38 +256,31 @@ def main() -> int:
     if reasserted:
         print("Already categorised, left untouched (not re-added to any section):")
         for base in sorted(reasserted):
-            print(f"  - {base.relative_to(ROOT).as_posix()} → {existing[base]}")
+            print(f"  - {base.relative_to(ROOT).as_posix()} → {existing[base].area}")
 
     if legacy:
         print(
             "warning: paper(s) from earlier commits still lack a marker; "
-            "left untouched (re-commit one of their files with [AREA: ...] to fix):",
+            "left untouched (re-commit one of their files with the full "
+            "commit message to fix):",
             file=sys.stderr,
         )
         for base in legacy:
             print(f"  - {base.relative_to(ROOT).as_posix()}", file=sys.stderr)
 
-    if not targets:
-        print("No paper from this push needs a .research-area marker. Nothing to do.")
-        emit_outputs(
-            ignored
-            + [
-                f"`{base.relative_to(ROOT).as_posix()}` 已有方向 **{existing[base]}**，未改动"
-                for base in sorted(reasserted)
-            ]
-            or ["No new marker was required for this push."]
-        )
-        return 0
-
-    assignments: dict[Path, str] = {}
+    assignments: dict[Path, Declaration] = {}
     problems: list[str] = []
     for base in targets:
         rel = base.relative_to(ROOT).as_posix()
         sha = introduced.get(base) or touched.get(base)
         candidates = list(usable.get(sha, []))
-        source = f"commit {sha[:8]}"
+        source = f"commit {sha[:8]}" if sha else "this push"
         if not candidates and len(all_areas) == 1:
-            candidates = list(all_areas)
+            candidates = [
+                declaration
+                for declaration in all_declarations
+                if declaration.area == all_areas[0]
+            ][:1]
             source = "the only area declared in this push"
 
         if len(candidates) == 1:
@@ -391,33 +290,72 @@ def main() -> int:
         else:
             problems.append(
                 f"`{rel}.pdf / .bib` — conflicting areas in {source}: "
-                + ", ".join(f"`{name}`" for name in candidates)
+                + ", ".join(f"`{item.area}`" for item in candidates)
                 + " (split into one commit per area)"
+            )
+
+    # Contract check: the four required fields must be present on the
+    # declaration that actually gets applied. Local hooks already blocked such
+    # a commit, so reaching this point means the hooks were skipped.
+    for base, declaration in assignments.items():
+        gaps = declaration.missing()
+        if gaps:
+            problems.append(
+                f"`{base.relative_to(ROOT).as_posix()}` — commit 注释缺少 "
+                + "、".join(gaps)
             )
 
     if problems:
         print("ERROR: cannot resolve research areas for all papers:", file=sys.stderr)
         for problem in problems:
             print(f"  - {problem}", file=sys.stderr)
-        print(
-            "\nFix: amend / re-commit with a message like "
-            "`[AREA: 大模型推理优化] 添加 Smith 2024 论文`, one area per commit.\n"
-            "See CONTRIBUTING.md for details.",
-            file=sys.stderr,
-        )
+        print("\n" + help_text(), file=sys.stderr)
         emit_outputs(problems + ignored)
         return 1
 
     written: list[str] = []
-    for base, area in sorted(assignments.items()):
-        marker = marker_for(base)
-        marker.write_text(area + "\n", encoding="utf-8")
-        written.append(f"`{marker.relative_to(ROOT).as_posix()}` → **{area}**")
+    staged: list[str] = []
+    for base, declaration in sorted(assignments.items()):
+        marker = write_marker(
+            base,
+            area=declaration.area,
+            contributor=declaration.contributor,
+            seq=declaration.seq,
+        )
+        staged.append(marker.relative_to(ROOT).as_posix())
+        written.append(
+            f"`{marker.relative_to(ROOT).as_posix()}` → **{declaration.area}**"
+            f"（贡献人 @{declaration.contributor or '未注明'}）"
+        )
 
-    print(f"Wrote {len(written)} .research-area marker(s):")
-    for line in written:
-        print("  " + line)
-    emit_outputs(written + ignored)
+    if written:
+        print(f"Wrote {len(written)} .research-area marker(s):")
+        for line in written:
+            print("  " + line)
+
+    # README is rebuilt here as well, and staged right after the markers, so
+    # the workflow's single `git commit` contains both. Without this the index
+    # would only catch up on the commit *after* the paper.
+    readme_changed = build_readme.write_readme()
+    if readme_changed and os.environ.get("GITHUB_ACTIONS"):
+        staged.append("README.md")
+    # Markers are staged by the workflow itself as well; staging them here
+    # keeps `git add` idempotent when README changed but no marker did.
+    if os.environ.get("GITHUB_ACTIONS") and staged:
+        stage(staged)
+
+    if not written and not readme_changed:
+        print("Nothing to do for this push.")
+
+    emit_outputs(
+        written
+        + (["`README.md` 已重建"] if readme_changed else [])
+        + ignored
+        + [
+            f"`{base.relative_to(ROOT).as_posix()}` 已有方向 **{existing[base].area}**，未改动"
+            for base in sorted(reasserted)
+        ]
+    )
     return 0
 
 

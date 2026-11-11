@@ -1,13 +1,31 @@
 #!/usr/bin/env python3
 """Aggregate paper entries by research area and regenerate README.md.
 
-Runs in the "Build README" workflow whenever a ``<stem>.research-area`` marker
-is pushed, or when the workflow is dispatched by the "Resolve Research Area"
-workflow (a GITHUB_TOKEN push cannot itself trigger another workflow).
+Runs in two places, with the same output for the same inputs:
+
+* ``.githooks/commit-msg`` (via ``scripts/apply_local.py``) — the normal path.
+  README.md is rewritten *inside the commit that adds the paper*, so the index
+  is already correct when it is pushed.
+* the "Resolve Research Area" / "Build README" workflows — the fallback for
+  contributors who did not install the hooks (web upload, ``--no-verify``).
 
 Layout: ``papers/<user>/<stem>.pdf`` + ``<stem>.bib`` + ``<stem>.research-area``.
 Files are matched by stem (the file name without its extension); file names may
 contain spaces, so PDF links are percent-encoded.
+
+Every entry is rendered as a numbered GB/T 7714-2015 reference plus its
+contributor::
+
+    1： ZHANG Z, WEN T, SUN S, et al. WeSCE: a benchmark for measuring security drift in LLM-driven code editing[J]. arXiv preprint arXiv:2608.15092, 2026. : [lihongweimail]
+
+The visible text follows GB/T 7714-2015 (see ``scripts/gbt7714.py``); the title
+is additionally a Markdown link to the PDF, so the reference stays standard
+while remaining clickable.
+
+Numbers are generated, never copied from the commit message: they are assigned
+per section, oldest entry first (``added`` date in the marker), so adding a new
+paper never renumbers the ones above it and two contributors can never claim
+the same number.
 
 The output is deterministic for a given set of inputs, so a no-op rebuild does
 not create a commit.
@@ -32,15 +50,18 @@ from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import quote
 
-ROOT = Path(__file__).resolve().parent.parent
-PAPERS = ROOT / "papers"
+from commit_contract import convention_lines
+from gbt7714 import format_reference
+from paper_index import (
+    MARKER_SUFFIX,
+    PAPER_SUFFIXES,
+    PAPERS,
+    ROOT,
+    read_marker,
+)
+
 README = ROOT / "README.md"
-MARKER_SUFFIX = ".research-area"
-PAPER_SUFFIXES = {".bib", ".pdf"}
-
-
-def marker_for(base: Path) -> Path:
-    return base.parent / (base.name + MARKER_SUFFIX)
+_FALLBACK_WARNED = False
 
 
 try:
@@ -128,7 +149,7 @@ def _parse_fields(body: str) -> dict[str, str]:
 def _parse_bib_fallback(text: str) -> list[dict[str, str]]:
     """Dependency-free parser for ordinary BibTeX entries."""
     entries: list[dict[str, str]] = []
-    for match in re.finditer(r"@\w+\s*\{\s*([^,\s]+)\s*,", text):
+    for match in re.finditer(r"@(\w+)\s*\{\s*([^,\s]+)\s*,", text):
         i, depth, in_quotes = match.end(), 1, False
         while i < len(text) and depth:
             char = text[i]
@@ -142,7 +163,8 @@ def _parse_bib_fallback(text: str) -> list[dict[str, str]]:
             i += 1
         body = text[match.end():max(match.end(), i - 1)]
         fields = _parse_fields(body)
-        fields["citekey"] = match.group(1)
+        fields["citekey"] = match.group(2)
+        fields["entry_type"] = match.group(1).lower()
         entries.append(fields)
     return entries
 
@@ -159,20 +181,27 @@ def parse_bib(path: Path) -> list[dict[str, str]]:
                 {
                     **{field.key.lower(): _clean(field.value) for field in entry.fields},
                     "citekey": entry.key,
+                    "entry_type": entry.entry_type.lower(),
                 }
                 for entry in library.entries
             ]
         # bibtexparser 1.x
         database = bibtexparser.loads(text)
         return [
-            {**{k.lower(): _clean(str(v)) for k, v in entry.items()}}
+            {
+                **{k.lower(): _clean(str(v)) for k, v in entry.items()},
+                "entry_type": str(entry.get("ENTRYTYPE", "misc")).lower(),
+            }
             for entry in database.entries
         ]
     except ImportError:
-        print(
-            "note: bibtexparser not installed, using the built-in BibTeX parser",
-            file=sys.stderr,
-        )
+        global _FALLBACK_WARNED
+        if not _FALLBACK_WARNED:
+            print(
+                "note: bibtexparser not installed, using the built-in BibTeX parser",
+                file=sys.stderr,
+            )
+            _FALLBACK_WARNED = True
         return _parse_bib_fallback(text)
     except Exception as exc:  # noqa: BLE001 - degrade instead of failing the CI job
         print(
@@ -187,100 +216,64 @@ def parse_bib(path: Path) -> list[dict[str, str]]:
 # Formatting helpers
 # --------------------------------------------------------------------------
 
-def format_authors(raw: str) -> str:
-    # Stubs generated without metadata carry an obvious REVIEW placeholder;
-    # render it as a clear to-do instead of pretending "authors" is a surname.
-    if not raw or raw.strip().upper().startswith("REVIEW"):
-        return "待补作者"
-    parts = [part.strip() for part in re.split(r"\s+and\s+", raw, flags=re.I) if part.strip()]
-    if not parts:
-        return "未知作者"
-    first = parts[0]
-    surname = first.split(",")[0].strip() if "," in first else first.split()[-1]
-    surname = surname.strip("{} ").strip()
-    if not surname:
-        return "未知作者"
-    if surname.lower() == "others":
-        return "et al."
-    return surname + " et al." if len(parts) > 1 else surname
-
-
 def parse_year(raw: str) -> int:
     match = re.search(r"\b(\d{4})\b", raw or "")
     return int(match.group(1)) if match else 0
 
 
-def md_escape(text: str) -> str:
-    return text.replace("\\", "\\\\").replace("[", "\\[").replace("]", "\\]")
+def render_contributor(account: str) -> str:
+    account = account.strip().lstrip("@")
+    return account or "未注明"
 
 
 @dataclass(frozen=True)
 class Entry:
     area: str
+    number: int
     title: str
-    authors: str
     year: int
     pdf: Path | None
     source: Path
+    record: dict[str, str]
+    contributor: str = ""
     needs_review: bool = False
+    # Marker creation date (ISO). Keeps the numbering append-only: a paper
+    # added later always gets a higher number than the existing ones.
+    added: str = ""
+
+    def numbered(self, number: int) -> "Entry":
+        return Entry(
+            area=self.area,
+            number=number,
+            title=self.title,
+            year=self.year,
+            pdf=self.pdf,
+            source=self.source,
+            record=self.record,
+            contributor=self.contributor,
+            needs_review=self.needs_review,
+            added=self.added,
+        )
 
     def render(self) -> str:
-        title = md_escape(self.title)
+        """One line of the index: ``<n>： <GB/T 7714-2015 著录> : [<账号>]``."""
+        pdf_url = None
         if self.pdf is not None:
             rel = self.pdf.relative_to(ROOT).as_posix()
-            title = f"[{title}]({quote(rel, safe='/-._~')})"
+            pdf_url = quote(rel, safe='/-._~')
         else:
             print(
                 f"warning: no PDF found for {self.source.relative_to(ROOT).as_posix()}, "
-                "rendering title without a link",
+                "rendering the reference without a link",
                 file=sys.stderr,
             )
-        year = str(self.year) if self.year else "n.d."
-        line = f"- {title} — {self.authors} — {year}"
+        reference = format_reference(self.record, pdf_url=pdf_url)
+        line = f"{self.number}： {reference} : [{render_contributor(self.contributor)}]"
         if self.needs_review:
             line += "（BibTeX 自动生成，待核对）"
-        return line
-
-
-# --------------------------------------------------------------------------
-# Fixed header: the commit message contract
-# --------------------------------------------------------------------------
-# This block is part of the generator on purpose. README.md is rebuilt from
-# scratch on every run, so a hand-written notice would be erased by the first
-# CI rebuild. Keeping it here makes the rule permanent and impossible to drift
-# away from what scripts/parse_area.py actually parses.
-
-COMMIT_CONVENTION = [
-    "## 提交前必读：commit 注释必须声明研究方向",
-    "",
-    "成员提交论文时，**commit 注释中必须写上 `[AREA: ...]`**，格式为：",
-    "",
-    "```text",
-    "该小节下的数字序号： <论文文件名> : [AREA: <研究方向>]  :  [贡献人 ： 项目成员的GitHub账号]",
-    "```",
-    "",
-    "典型示例（本条对应 `papers/lihongwei/` 下的 WeSCE，"
-    "`Intelligence Software Engineering` 小节的第 1 条）：",
-    "",
-    "```text",
-    "1： WeSCE A Benchmark for Measuring Security : [AREA: Intelligence Software Engineering]  :  [贡献人 ： lihongweimail]",
-    "```",
-    "",
-    "- `[AREA: ...]` 里的方向名会被写成该论文的 `<文件名>.research-area` 标记，"
-    "并作为下面每个小节的标题，请保持简短、稳定。",
-    "- 数字序号填该论文在所属方向小节里的顺序号（新提交取该小节当前条目数 + 1）；"
-    "`<论文文件名>` 与 `papers/<你的用户名>/` 下的文件名一致，不含扩展名。",
-    "- **一次 commit 只写一个方向**；不同方向的论文请分开提交，否则 CI 会判为冲突。",
-    "- 漏写 `[AREA: ...]` 时 CI 会**失败（红色 ✗）**，补正方式："
-    "`git add <论文> && git commit --amend --no-edit` 后重新 push。",
-    "- 论文与同名 `.bib` 必须在**同一个 commit** 中提交；首次 clone 后先执行 "
-    "`sh scripts/install_hooks.sh` 安装 pre-commit hook，缺 `.bib` 时会在提交前自动生成。",
-    "- **旧论文跳过、新论文照常归类**：若 commit 注释里写的是**已有论文**及其方向"
-    "（复制模板、顺带提及、或修改旧论文时又写一遍），这条声明会被**识别并忽略**——"
-    "那篇论文保持原小节，不会被移动，也不会重复出现在新方向里；"
-    "而**尚未归类的新论文**仍按原来的行为，直接写入 `[AREA: ...]` 对应的研究方向小节。",
-    "- 完整目录结构与贡献流程见 [CONTRIBUTING.md](CONTRIBUTING.md)。",
-]
+        # Two trailing spaces: a hard line break, so consecutive references do
+        # not collapse into one paragraph on GitHub.
+        return line + "  "
 
 
 # --------------------------------------------------------------------------
@@ -308,23 +301,16 @@ def collect_entries() -> list[Entry]:
             bucket["bib" if suffix == ".bib" else "pdf"].append(file_path)
 
         for base in sorted(grouped):
-            marker = marker_for(base)
-            if not marker.is_file():
-                continue
-            area = " ".join(marker.read_text(encoding="utf-8").split())
-            if not area:
-                print(
-                    f"warning: empty marker at {marker.relative_to(ROOT).as_posix()}, skipped",
-                    file=sys.stderr,
-                )
+            marker = read_marker(base)
+            if marker is None or not marker.area:
                 continue
 
             bib_files = grouped[base]["bib"]
             if not bib_files:
                 print(
                     f"warning: {base.relative_to(ROOT).as_posix()}.pdf has no matching "
-                    ".bib; skipped (the Resolve Research Area workflow generates it, "
-                    "or run scripts/pdf_to_bib.py locally)",
+                    ".bib; skipped (run scripts/pdf_to_bib.py locally, or "
+                    "'sh scripts/install_hooks.sh' and re-commit)",
                     file=sys.stderr,
                 )
                 continue
@@ -342,13 +328,16 @@ def collect_entries() -> list[Entry]:
             for record in parse_bib(bib_path):
                 entries.append(
                     Entry(
-                        area=area,
+                        area=marker.area,
+                        number=0,  # assigned per section in build_markdown()
                         title=record.get("title") or record.get("citekey") or base.name,
-                        authors=format_authors(record.get("author", "")),
                         year=parse_year(record.get("year", "")),
                         pdf=pdf,
                         source=bib_path,
+                        record=record,
+                        contributor=marker.contributor,
                         needs_review=needs_review,
+                        added=marker.added,
                     )
                 )
     return entries
@@ -359,11 +348,11 @@ def build_markdown(entries: list[Entry]) -> str:
     lines = [
         "# GroupPaperCollecting 文献清单",
         "",
-        f"> 本文件由 GitHub Actions 自动生成，请勿手动编辑。最后更新于 {today}。",
+        f"> 本文件由提交 hook / GitHub Actions 自动生成，请勿手动编辑。最后更新于 {today}。",
         ">",
         "> A repository for students in our Group committing the reading Papers for Collecting.",
         "",
-        *COMMIT_CONVENTION,
+        *convention_lines(),
         "",
     ]
 
@@ -377,22 +366,36 @@ def build_markdown(entries: list[Entry]) -> str:
 
     for area in sorted(groups, key=area_sort_key):
         lines += [f"## {area}", ""]
-        for entry in sorted(
+        ordered = sorted(
             groups[area],
-            key=lambda item: (-item.year, item.title.lower(), item.source.as_posix()),
-        ):
-            lines.append(entry.render())
+            key=lambda item: (
+                item.added,
+                -item.year,
+                item.title.lower(),
+                item.source.as_posix(),
+            ),
+        )
+        for number, entry in enumerate(ordered, start=1):
+            lines.append(entry.numbered(number).render())
         lines.append("")
     return "\n".join(lines)
 
 
-def main() -> int:
+def write_readme(quiet: bool = False) -> bool:
+    """Rebuild README.md. Returns True when the file changed."""
     content = build_markdown(collect_entries())
     if README.is_file() and README.read_text(encoding="utf-8") == content:
-        print("README.md is already up to date.")
-        return 0
+        if not quiet:
+            print("README.md is already up to date.")
+        return False
     README.write_text(content, encoding="utf-8")
-    print(f"Wrote {README.relative_to(ROOT).as_posix()}.")
+    if not quiet:
+        print(f"Wrote {README.relative_to(ROOT).as_posix()}.")
+    return True
+
+
+def main() -> int:
+    write_readme()
     return 0
 
 

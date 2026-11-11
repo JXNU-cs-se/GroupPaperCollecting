@@ -1,0 +1,40 @@
+#!/bin/sh
+# post-commit (3/4): write the marker, rebuild README.md, fold both into the
+# commit that was just created.
+#
+# Why here: git builds the commit tree from an index snapshot taken *before*
+# the pre-commit hook, and only re-reads the index after pre-commit. Files
+# staged in prepare-commit-msg / commit-msg therefore land in the NEXT commit —
+# the "README is always one commit behind" bug. post-commit is the first moment
+# where writing files is both allowed and immediately committable, so the two
+# generated files are folded in with `git commit --amend --no-edit`.
+#
+# The amend runs with --no-verify so the hooks are not re-entered; GPC_FINISHING
+# is a second guard in case a hook path ignores that flag.
+#
+# Enable once per clone:
+#
+#     sh scripts/install_hooks.sh
+set -eu
+
+if [ -n "${GPC_FINISHING:-}" ]; then
+  exit 0
+fi
+
+root=$(git rev-parse --show-toplevel)
+cd "$root"
+
+if ! command -v python3 >/dev/null 2>&1; then
+  exit 0
+fi
+
+# Nothing to do unless this repository has an index under papers/.
+if [ ! -d papers ]; then
+  exit 0
+fi
+
+GPC_FINISHING=1
+export GPC_FINISHING
+
+message=$(git log -1 --format=%B)
+exec python3 scripts/apply_local.py --message "$message" --from-head --amend

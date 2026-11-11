@@ -1,0 +1,37 @@
+#!/bin/sh
+# commit-msg (2/4): validate the commit message BEFORE the commit exists.
+#
+# Git has already snapshotted the index at this point, so files written here
+# would only be picked up by the *next* commit. This stage therefore only
+# validates: the message must carry the four required pieces — position
+# number, paper file name, [AREA: ...] and [贡献人 ： <GitHub account>].
+# Anything missing aborts the commit and prints the correct format, instead of
+# letting CI fail after the push.
+#
+# The marker and README.md are written by .githooks/post-commit, which can
+# still fold them into the commit that was just created.
+#
+# Enable once per clone:
+#
+#     sh scripts/install_hooks.sh
+#
+# Merge/revert/bot commits are ignored, and a commit that touches nothing under
+# papers/ (or only papers that already have a marker) is not checked at all.
+set -eu
+
+root=$(git rev-parse --show-toplevel)
+cd "$root"
+
+message_file=${1:-}
+if [ -z "$message_file" ] || [ ! -f "$message_file" ]; then
+  echo "commit-msg: no message file given; skipping the paper index check." >&2
+  exit 0
+fi
+
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "commit-msg: python3 is required to validate the commit message." >&2
+  echo "commit-msg: install Python 3 and try again." >&2
+  exit 1
+fi
+
+exec python3 scripts/apply_local.py --message-file "$message_file" --check-only

@@ -1,10 +1,15 @@
 #!/bin/sh
-# pre-commit: keep every PDF and its BibTeX in the SAME commit.
+# pre-commit (1/2): keep every PDF and its BibTeX in the SAME commit.
 #
 # A contributor who only stages papers/<user>/<stem>.pdf gets
 # papers/<user>/<stem>.bib generated on the spot and added to the index, so both
-# files land in that one commit. CI no longer generates BibTeX; it only verifies
-# this invariant and fails when a .bib is missing.
+# files land in that one commit.
+#
+# This hook also covers the "file exists but carries no BibTeX" case: an empty
+# or half-written .bib (a failed export, a placeholder committed earlier) is
+# treated as missing and regenerated from the PDF. CI only *verifies* this
+# invariant (`pdf_to_bib.py --check --fail`); it never creates files, because a
+# bot-generated .bib would land in a second commit.
 #
 # Enable once per clone (hooks are local, not cloned automatically):
 #
@@ -12,10 +17,12 @@
 #
 # Behaviour:
 #   * only staged, added/modified/renamed PDFs are inspected;
-#   * an existing .bib (committed or already staged) is never regenerated;
+#   * a .bib that already contains at least one "@type{" entry is never touched;
 #   * generation needs network access for good metadata; without it a clearly
 #     marked REVIEW stub is written rather than blocking the commit;
-#   * if no .bib can be produced, the commit is aborted.
+#   * if no .bib with usable content can be produced, the commit is aborted.
+#
+# Set PDF_TO_BIB_OFFLINE=1 to skip network lookups (fast, stub-only).
 set -eu
 
 root=$(git rev-parse --show-toplevel)
@@ -30,8 +37,13 @@ fi
 # --diff-filter=AMR: added, modified, renamed. quotePath=false keeps non-ASCII
 # and space-containing paths usable. Paths are newline separated; a filename
 # containing a literal newline is not supported (rare, and git itself mangles it).
+# Only the flat layout counts: papers/<user>/<file>.pdf. A PDF in a nested
+# directory is a leftover from the old layout and is ignored on purpose, so it
+# cannot block a commit.
+PAPER_PATH_RE='^papers/[^/]+/[^/]+\.pdf$'
+
 staged_pdfs=$(git -c core.quotePath=false diff --cached --name-only \
-  --diff-filter=AMR -- 'papers/' | grep -Ei '\.pdf$' || true)
+  --diff-filter=AMR -- 'papers/' | grep -Ei "$PAPER_PATH_RE" || true)
 
 # `git commit --amend` stages nothing new, so the index matches HEAD and the
 # list above is empty. Include the PDFs of HEAD as well: when amending, HEAD is
@@ -40,57 +52,77 @@ staged_pdfs=$(git -c core.quotePath=false diff --cached --name-only \
 # HEAD PDFs already have their .bib, so this adds no work.
 committed_pdfs=$(git -c core.quotePath=false diff-tree --root --no-commit-id \
   --name-only --diff-filter=AMR -r HEAD -- 'papers/' 2>/dev/null \
-  | grep -Ei '\.pdf$' || true)
+  | grep -Ei "$PAPER_PATH_RE" || true)
 
-candidates=$(printf '%s\n%s\n' "$staged_pdfs" "$committed_pdfs" \
-  | sed '/^$/d' | sort -u)
+work=$(mktemp)
+trap 'rm -f "$work"' EXIT
+printf '%s\n%s\n' "$staged_pdfs" "$committed_pdfs" | sed '/^$/d' | sort -u > "$work"
 
-if [ -z "$candidates" ]; then
+if [ ! -s "$work" ]; then
   exit 0
 fi
 
-printf '%s\n' "$candidates" | while IFS= read -r pdf; do
+# Content of the version of $1 that this commit would record: the staged blob
+# when there is one, otherwise the committed one. Empty when neither exists.
+recorded_bib() {
+  if git cat-file -e ":$1" 2>/dev/null; then
+    git show ":$1"
+  elif git cat-file -e "HEAD:$1" 2>/dev/null; then
+    git show "HEAD:$1"
+  fi
+}
+
+# A real entry starts a line with @type{  — comments alone do not count.
+has_bibtex() {
+  printf '%s\n' "$1" | grep -Eq '^[[:space:]]*@[A-Za-z]+[[:space:]]*[{(]'
+}
+
+while IFS= read -r pdf; do
   [ -n "$pdf" ] || continue
   bib="${pdf%.*}.bib"
 
-  # Already committed or already staged: nothing to do.
-  if git cat-file -e "HEAD:$bib" 2>/dev/null; then
-    continue
-  fi
-  if ! git diff --cached --quiet -- "$bib"; then
+  content=$(recorded_bib "$bib" || true)
+  if has_bibtex "$content"; then
     continue
   fi
 
-  echo "pre-commit: $pdf has no staged BibTeX; generating $bib"
-  # Set PDF_TO_BIB_OFFLINE=1 to skip network lookups (fast, stub-only).
+  if [ -n "$content" ]; then
+    echo "pre-commit: $bib has no BibTeX entry; regenerating it from $pdf"
+  else
+    echo "pre-commit: $pdf has no BibTeX; generating $bib"
+  fi
+
   extra=""
   if [ "${PDF_TO_BIB_OFFLINE:-}" = "1" ]; then
     extra="--offline"
   fi
+  # --force: the .bib may exist on disk while being empty/unusable.
   # shellcheck disable=SC2086
-  if ! python3 scripts/pdf_to_bib.py "$pdf" --quiet $extra; then
+  if ! python3 scripts/pdf_to_bib.py "$pdf" --quiet --force $extra; then
     echo "pre-commit: failed to generate $bib." >&2
-    echo "pre-commit: add it manually, stage it, and commit again." >&2
+    echo "pre-commit: fix it manually, stage it, and commit again." >&2
     exit 1
   fi
   if [ ! -f "$bib" ]; then
     echo "pre-commit: $bib was not created." >&2
-    echo "pre-commit: add it manually, stage it, and commit again." >&2
+    echo "pre-commit: fix it manually, stage it, and commit again." >&2
     exit 1
   fi
   git add -- "$bib"
-done
+done < "$work"
 
-# Final assertion: the invariant must hold after the loop. This also catches a
-# generator that silently wrote nothing.
-printf '%s\n' "$candidates" | while IFS= read -r pdf; do
+# Final assertion: after the loop every staged PDF must be accompanied by a
+# .bib that really contains BibTeX. This also catches a generator that wrote
+# an empty file. Runs in this shell, so `exit 1` aborts the commit.
+while IFS= read -r pdf; do
   [ -n "$pdf" ] || continue
   bib="${pdf%.*}.bib"
-  if git cat-file -e "HEAD:$bib" 2>/dev/null; then
-    continue
-  fi
-  if git diff --cached --quiet -- "$bib"; then
-    echo "pre-commit: $pdf still has no staged $bib; aborting the commit." >&2
+  content=$(recorded_bib "$bib" || true)
+  if ! has_bibtex "$content"; then
+    echo "pre-commit: $bib is missing or contains no BibTeX entry; aborting the commit." >&2
+    echo "pre-commit: add it manually (or delete it so this hook can rebuild it)." >&2
     exit 1
   fi
-done
+done < "$work"
+
+exit 0

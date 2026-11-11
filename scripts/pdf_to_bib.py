@@ -66,6 +66,16 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 PAPERS = ROOT / "papers"
 
+try:  # same directory when run as `python3 scripts/pdf_to_bib.py`
+    from paper_index import has_bibtex_entries
+except ImportError:  # pragma: no cover - keep the script standalone
+    def has_bibtex_entries(path: Path) -> bool:
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return False
+        return bool(re.search(r"^[ \t]*@[A-Za-z]+[ \t]*[{(]", text, re.MULTILINE))
+
 USER_AGENT = "GroupPaperCollecting-pdf-to-bib/2.0 (mailto: repo maintainers)"
 TIMEOUT = 12
 
@@ -510,6 +520,11 @@ def main() -> int:
     )
     parser.add_argument("--offline", action="store_true", help="skip all network lookups")
     parser.add_argument(
+        "--force", action="store_true",
+        help="regenerate even when a .bib already exists (used by the pre-commit "
+             "hook when the file exists but contains no BibTeX entry)",
+    )
+    parser.add_argument(
         "--quiet", action="store_true",
         help="suppress the trailing review checklist (used by the pre-commit hook)",
     )
@@ -523,23 +538,31 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    missing = [
-        pdf for pdf in iter_pdfs(args.pdfs) if not pdf.with_suffix(".bib").is_file()
-    ]
+    # A .bib only counts when it really holds BibTeX. An empty or half-written
+    # file is the same problem as a missing one, and is regenerated too.
+    candidates = iter_pdfs(args.pdfs)
+    if args.force:
+        missing = candidates
+    else:
+        missing = [
+            pdf for pdf in candidates
+            if not has_bibtex_entries(pdf.with_suffix(".bib"))
+        ]
 
     if not missing:
-        print("Every PDF already has a matching .bib. Nothing to do.")
+        print("Every PDF already has a usable .bib. Nothing to do.")
         if args.ci:
             write_ci_outputs([], args.list_generated)
         return 0
 
     if args.check:
-        print(f"{len(missing)} PDF(s) without a matching .bib:")
+        print(f"{len(missing)} PDF(s) without a usable .bib (missing or no @entry):")
         for pdf in missing:
             print(f"  - {pdf.relative_to(ROOT).as_posix()}")
         if args.fail:
             print(
-                "\nERROR: every PDF must be committed together with a same-named .bib.\n"
+                "\nERROR: every PDF must be committed together with a same-named "
+                ".bib that contains at least one BibTeX entry.\n"
                 "Enable the pre-commit hook once per clone:\n"
                 "    sh scripts/install_hooks.sh\n"
                 "then stage the PDF again and amend the commit:\n"
@@ -577,7 +600,8 @@ def main() -> int:
             "  1. Verify title / author / year / cite key.\n"
             "  2. Delete the %% header lines to clear the README '待核对' badge.\n"
             "  3. Stage the .bib together with the PDF so both share one commit:\n"
-            '       git add "<pdf>" "<bib>" && git commit -m "[AREA: <方向>] ..."\n'
+            '       git add "<pdf>" "<bib>" && git commit\n'
+            "     (the commit message must carry the full declaration, see CONTRIBUTING.md)\n"
             "The pre-commit hook does step 3 for you when you stage only the PDF.\n"
             "CI never generates or commits a .bib; it only verifies that one exists.\n"
             + "=" * 72
