@@ -1,15 +1,13 @@
 name: Build README
 
 # README.md is generated, never edited by hand. Rebuilds happen when:
-#   * "Resolve Research Area and Missing BibTeX" dispatches this workflow after
-#     committing generated .bib + marker files (a GITHUB_TOKEN push cannot
-#     trigger push-based workflows by itself), or
+#   * "Resolve Research Area" dispatches this workflow after committing markers
+#     (a GITHUB_TOKEN push cannot trigger push-based workflows by itself), or
 #   * a human pushes/edits a marker or a .bib directly.
 #
-# The PDF -> BibTeX generator is wired in here as a READ-ONLY check. Generating
-# files inside this job would leave uncommitted .bib files behind, because this
-# workflow only stages README.md. Generation and committing belong to the
-# resolve workflow above.
+# The PDF -> BibTeX generator is wired in here as a READ-ONLY check. Generation
+# happens in the local pre-commit hook so that a PDF and its .bib share one
+# commit; this job must never create files it does not commit.
 on:
   push:
     branches: [main]
@@ -48,8 +46,9 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Report PDFs still missing a .bib (read-only)
-        # Does not write or stage anything; surfaces a failed generation step.
+      - name: Report PDFs without a .bib (read-only)
+        # Does not write or stage anything. The hard gate lives in the resolve
+        # workflow; here it is just visible in the log.
         run: python3 scripts/pdf_to_bib.py --check
 
       - name: Aggregate by research area
