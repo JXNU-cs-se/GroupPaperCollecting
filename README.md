@@ -30,3 +30,4 @@
 
 - [WeSCE: A Benchmark for Measuring Security Drift in LLM-Driven Code Editing](papers/lihongwei/WeSCE%20A%20Benchmark%20for%20Measuring%20Security.pdf) — Zhang et al. — 2026
 - [Deep learning-based software engineering: progress, challenges, and opportunities](papers/lihongwei/Deep%20Learning-based%20Software%20Engineering%20Progress%2C%20Challenges%2C%20and%20Opportunities.pdf) — Chen et al. — 2024（BibTeX 自动生成，待核对）
+- [Practitioners' expectations on automated code comment generation](papers/lihongwei/ICSE22%20Practitioners%20Expectations%20on%20Automated%20Code%20Comment%20Generation.pdf) — Hu et al. — 2022
