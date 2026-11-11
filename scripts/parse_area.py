@@ -27,6 +27,10 @@ Contract
 
 Attribution rules (in order)
 ----------------------------
+0. A declaration that names an ALREADY categorised paper (template
+   ``<title> : [AREA: ...]``) is **ignored**: the paper keeps its existing
+   marker, is never moved to another section, and the declaration is not
+   inherited by a newly added paper. This is reported in the step summary.
 1. For a paper introduced by one of the commits in this push, use the
    ``[AREA: ...]`` value from *that specific commit*. This allows one push to
    contain several commits covering several different areas, as long as each
@@ -45,6 +49,7 @@ Environment
 
 from __future__ import annotations
 
+import difflib
 import os
 import re
 import subprocess
@@ -64,11 +69,90 @@ AREA_RE = re.compile(
 )
 # papers/<user>/<file>
 PAPER_PATH_RE = re.compile(r"^papers/([^/]+)/(.+)$")
+BIB_TITLE_RE = re.compile(r"\btitle\s*=\s*[{\"](.+?)[}\"]\s*,", re.IGNORECASE | re.DOTALL)
 
 
 def marker_for(base: Path) -> Path:
     """Marker path for a stem path (a Path with no extension)."""
     return base.parent / (base.name + MARKER_SUFFIX)
+
+
+# --------------------------------------------------------------------------
+# Commit message declarations
+# --------------------------------------------------------------------------
+
+def declarations_in(message: str) -> list[tuple[str, str]]:
+    """Return ``(area, paper_title)`` pairs declared in a commit message.
+
+    The documented template is ``<paper title> : [AREA: <area>]``, so the text
+    between the start of the bracket's line and the bracket itself is treated
+    as a *reference to a paper* only when it ends with a colon. Anything else
+    (``[AREA: x] add Smith 2024``, ``docs: 说明 [AREA: ...] 的用法``) is prose
+    and yields an empty title.
+
+    ``paper_title`` matters because a member may legitimately mention an
+    already-categorised paper in the same commit message (copying the template,
+    a "see also" note, or re-touching that paper). Such a declaration must not
+    be applied to the new paper, and must not move the old one.
+    """
+    declarations: list[tuple[str, str]] = []
+    for match in AREA_RE.finditer(message):
+        area = " ".join(match.group(1).split())
+        if not area:
+            continue
+        line_start = message.rfind("\n", 0, match.start()) + 1
+        prefix = message[line_start:match.start()].strip()
+        title = ""
+        if prefix.endswith((":", "：")):
+            candidate = prefix[:-1].strip(" \t-—–·*#>")
+            # Guard against a long prose line that merely happens to end with
+            # a colon, and against a previously parsed "[AREA: ...]" fragment.
+            if candidate and len(candidate) <= 200 and "[" not in candidate:
+                title = candidate
+        declarations.append((area, title))
+    return declarations
+
+
+def norm_text(text: str) -> str:
+    """Letters/digits/CJK only, lowercased: 'WeSCE: A Benchmark' -> 'wesceabenchmark'."""
+    return re.sub(r"[^0-9a-z\u4e00-\u9fff]+", "", text.lower())
+
+
+def bib_title(bib_path: Path) -> str:
+    try:
+        head = bib_path.read_text(encoding="utf-8", errors="replace")[:4000]
+    except OSError:
+        return ""
+    match = BIB_TITLE_RE.search(head)
+    if not match:
+        return ""
+    raw = re.sub(r"\\(?:emph|textbf|textit)\{([^{}]*)\}", r"\1", match.group(1))
+    return " ".join(raw.replace("{", "").replace("}", "").split())
+
+
+def title_matches_paper(title: str, base: Path) -> bool:
+    """Does ``title`` refer to the paper at ``base``?
+
+    Compared against the file stem and the BibTeX title, both normalised, so
+    "WeSCE A Benchmark for Measuring Security" matches a file of that name as
+    well as the fuller title stored in its .bib.
+    """
+    needle = norm_text(title)
+    if not needle:
+        return False
+    keys = [norm_text(base.name), norm_text(bib_title(base.with_suffix(".bib")))]
+    for key in keys:
+        if not key:
+            continue
+        if needle == key:
+            return True
+        # A contributor often types an abbreviated title ("WeSCE A Benchmark
+        # for Measuring Security" vs. the full published title).
+        if len(needle) >= 12 and (needle in key or key in needle):
+            return True
+        if difflib.SequenceMatcher(None, needle, key).ratio() >= 0.86:
+            return True
+    return False
 
 
 def git(*args: str, check: bool = True) -> str:
@@ -181,11 +265,17 @@ def paper_bases() -> list[Path]:
 def areas_in(message: str) -> list[str]:
     """Unique, non-empty area names declared in a commit message, in order."""
     seen: list[str] = []
-    for raw in AREA_RE.findall(message):
-        name = " ".join(raw.split())
-        if name and name not in seen:
-            seen.append(name)
+    for area, _title in declarations_in(message):
+        if area not in seen:
+            seen.append(area)
     return seen
+
+
+def read_marker(base: Path) -> str:
+    try:
+        return " ".join(marker_for(base).read_text(encoding="utf-8").split())
+    except OSError:
+        return ""
 
 
 def emit_outputs(lines: list[str]) -> None:
@@ -199,19 +289,59 @@ def emit_outputs(lines: list[str]) -> None:
 def main() -> int:
     commits = push_commits()
     messages = {sha: commit_message(sha) for sha in commits}
-    all_areas: list[str] = []
-    for message in messages.values():
-        for area in areas_in(message):
-            if area not in all_areas:
-                all_areas.append(area)
 
     introduced = introduced_bases(commits)
     touched = touched_bases(commits)
-    unmarked = [base for base in paper_bases() if not marker_for(base).is_file()]
+
+    bases = paper_bases()
+    existing = {base: read_marker(base) for base in bases if marker_for(base).is_file()}
+    unmarked = [base for base in bases if base not in existing]
+
+    # A commit message may mention an ALREADY categorised paper together with
+    # its area (template copy-paste, a "see also" note, or simply re-touching
+    # that paper). Those declarations are ignored: they must never move the
+    # paper into another section, and they must not be inherited by a new paper
+    # committed at the same time.
+    usable: dict[str, list[str]] = {}
+    ignored: list[str] = []
+    for sha, message in messages.items():
+        for area, title in declarations_in(message):
+            if title:
+                owner = next(
+                    (base for base in existing if title_matches_paper(title, base)),
+                    None,
+                )
+                if owner is not None:
+                    kept = existing[owner]
+                    reason = (
+                        "方向与现有标记一致" if kept == area else f"现有方向为 **{kept}**"
+                    )
+                    ignored.append(
+                        f"`{owner.name}` — 已有方向，忽略本次声明 `{area}`（{reason}）"
+                    )
+                    continue
+            bucket = usable.setdefault(sha, [])
+            if area not in bucket:
+                bucket.append(area)
+
+    all_areas: list[str] = []
+    for sha in commits:
+        for area in usable.get(sha, []):
+            if area not in all_areas:
+                all_areas.append(area)
+
     # Only papers this push actually touched are in scope. Older unmarked
     # papers must NOT inherit an area from somebody else's commit message.
     targets = [base for base in unmarked if base in introduced or base in touched]
     legacy = [base for base in unmarked if base not in introduced and base not in touched]
+    reasserted = [base for base in existing if base in introduced or base in touched]
+
+    for line in ignored:
+        print(f"ignored: {line}")
+    if reasserted:
+        print("Already categorised, left untouched (not re-added to any section):")
+        for base in sorted(reasserted):
+            print(f"  - {base.relative_to(ROOT).as_posix()} → {existing[base]}")
 
     if legacy:
         print(
@@ -224,7 +354,14 @@ def main() -> int:
 
     if not targets:
         print("No paper from this push needs a .research-area marker. Nothing to do.")
-        emit_outputs(["No new marker was required for this push."])
+        emit_outputs(
+            ignored
+            + [
+                f"`{base.relative_to(ROOT).as_posix()}` 已有方向 **{existing[base]}**，未改动"
+                for base in sorted(reasserted)
+            ]
+            or ["No new marker was required for this push."]
+        )
         return 0
 
     assignments: dict[Path, str] = {}
@@ -232,7 +369,7 @@ def main() -> int:
     for base in targets:
         rel = base.relative_to(ROOT).as_posix()
         sha = introduced.get(base) or touched.get(base)
-        candidates = areas_in(messages[sha])
+        candidates = list(usable.get(sha, []))
         source = f"commit {sha[:8]}"
         if not candidates and len(all_areas) == 1:
             candidates = list(all_areas)
@@ -259,7 +396,7 @@ def main() -> int:
             "See CONTRIBUTING.md for details.",
             file=sys.stderr,
         )
-        emit_outputs(problems)
+        emit_outputs(problems + ignored)
         return 1
 
     written: list[str] = []
@@ -271,7 +408,7 @@ def main() -> int:
     print(f"Wrote {len(written)} .research-area marker(s):")
     for line in written:
         print("  " + line)
-    emit_outputs(written)
+    emit_outputs(written + ignored)
     return 0
 
 

@@ -272,6 +272,9 @@ COMMIT_CONVENTION = [
     "`git add <论文> && git commit --amend --no-edit` 后重新 push。",
     "- 论文与同名 `.bib` 必须在**同一个 commit** 中提交；首次 clone 后先执行 "
     "`sh scripts/install_hooks.sh` 安装 pre-commit hook，缺 `.bib` 时会在提交前自动生成。",
+    "- 若 commit 注释里写了**已有论文**的方向（复制模板、顺带提及、或修改旧论文时又写一遍），"
+    "该声明会被**识别并忽略**：那篇论文保持原小节，不会被移动，也不会重复出现在新方向里。"
+    "只有**尚未归类**的新论文才会使用 `[AREA: ...]`。",
     "- 完整目录结构与贡献流程见 [CONTRIBUTING.md](CONTRIBUTING.md)。",
 ]
 
