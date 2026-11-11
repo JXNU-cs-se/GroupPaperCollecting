@@ -1,0 +1,319 @@
+#!/usr/bin/env python3
+"""Aggregate paper entries by research area and regenerate README.md.
+
+Runs in the "Build README" workflow whenever a ``.research-area`` marker is
+pushed, or when the workflow is dispatched by the "Resolve Research Area"
+workflow (a GITHUB_TOKEN push cannot itself trigger another workflow).
+
+The output is deterministic for a given set of inputs, so a no-op rebuild does
+not create a commit.
+
+``bibtexparser`` is used when available; both the v1 (``loads``/``load``) and
+v2 (``parse_string``) APIs are supported. A small built-in parser is used as a
+fallback so the aggregator still works in a bare environment (local preview,
+or a runner where the dependency install failed).
+"""
+
+from __future__ import annotations
+
+import re
+import sys
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from urllib.parse import quote
+
+ROOT = Path(__file__).resolve().parent.parent
+PAPERS = ROOT / "papers"
+README = ROOT / "README.md"
+MARKER = ".research-area"
+
+try:
+    # Chinese area names are sorted by pinyin, which is what "alphabetical"
+    # means for a mostly-Chinese index. Falls back to code point order when the
+    # optional dependency is absent (e.g. a bare local preview).
+    from pypinyin import lazy_pinyin
+
+    def area_sort_key(area: str) -> tuple[str, str]:
+        return (" ".join(lazy_pinyin(area)).lower(), area.lower())
+
+except ImportError:  # pragma: no cover
+
+    def area_sort_key(area: str) -> tuple[str, str]:
+        return (area, area.lower())
+
+
+# --------------------------------------------------------------------------
+# BibTeX parsing
+# --------------------------------------------------------------------------
+
+def _clean(value: str) -> str:
+    value = " ".join(value.split())
+    # Unwrap common text-formatting commands: \emph{KV} -> KV
+    value = re.sub(
+        r"\\(?:emph|textbf|textit|texttt|textsc|mathrm|operatorname)"
+        r"\{([^{}]*)\}",
+        r"\1",
+        value,
+    )
+    # BibTeX protects capitalisation with braces: {KV} Cache -> KV Cache
+    for _ in range(4):
+        unwrapped = re.sub(r"\{([^{}]*)\}", r"\1", value)
+        if unwrapped == value:
+            break
+        value = unwrapped
+    value = re.sub(r"\\([{}&_%])", r"\1", value)
+    value = value.replace(r"\"", '"')
+    return value.strip()
+
+
+def _read_value(text: str, i: int) -> tuple[str, int]:
+    n = len(text)
+    while i < n and text[i] in " \t\r\n":
+        i += 1
+    if i >= n:
+        return "", i
+    if text[i] == "{":
+        depth, i, start = 1, i + 1, i + 1
+        while i < n and depth:
+            if text[i] == "{":
+                depth += 1
+            elif text[i] == "}":
+                depth -= 1
+            i += 1
+        return text[start:max(start, i - 1)], i
+    if text[i] == '"':
+        i, start = i + 1, i + 1
+        while i < n and text[i] != '"':
+            i += 1
+        return text[start:i], i + 1
+    start = i
+    while i < n and text[i] != ",":
+        i += 1
+    return text[start:i], i
+
+
+def _parse_fields(body: str) -> dict[str, str]:
+    fields: dict[str, str] = {}
+    i, n = 0, len(body)
+    while i < n:
+        while i < n and body[i] in " \t\r\n,":
+            i += 1
+        match = re.match(r"(\w+)\s*=\s*", body[i:])
+        if not match:
+            i += 1
+            continue
+        key = match.group(1).lower()
+        i += match.end()
+        raw, i = _read_value(body, i)
+        fields[key] = _clean(raw)
+    return fields
+
+
+def _parse_bib_fallback(text: str) -> list[dict[str, str]]:
+    """Dependency-free parser for ordinary BibTeX entries."""
+    entries: list[dict[str, str]] = []
+    for match in re.finditer(r"@\w+\s*\{\s*([^,\s]+)\s*,", text):
+        i, depth, in_quotes = match.end(), 1, False
+        while i < len(text) and depth:
+            char = text[i]
+            if char == '"' and (i == 0 or text[i - 1] != "\\"):
+                in_quotes = not in_quotes
+            elif not in_quotes:
+                if char == "{":
+                    depth += 1
+                elif char == "}":
+                    depth -= 1
+            i += 1
+        body = text[match.end():max(match.end(), i - 1)]
+        fields = _parse_fields(body)
+        fields["citekey"] = match.group(1)
+        entries.append(fields)
+    return entries
+
+
+def parse_bib(path: Path) -> list[dict[str, str]]:
+    text = path.read_text(encoding="utf-8", errors="replace")
+    try:
+        import bibtexparser  # type: ignore
+
+        if hasattr(bibtexparser, "parse_string"):
+            # bibtexparser >= 2
+            library = bibtexparser.parse_string(text)
+            return [
+                {
+                    **{field.key.lower(): _clean(field.value) for field in entry.fields},
+                    "citekey": entry.key,
+                }
+                for entry in library.entries
+            ]
+        # bibtexparser 1.x
+        database = bibtexparser.loads(text)
+        return [
+            {**{k.lower(): _clean(str(v)) for k, v in entry.items()}}
+            for entry in database.entries
+        ]
+    except ImportError:
+        print(
+            "note: bibtexparser not installed, using the built-in BibTeX parser",
+            file=sys.stderr,
+        )
+        return _parse_bib_fallback(text)
+    except Exception as exc:  # noqa: BLE001 - degrade instead of failing the CI job
+        print(
+            f"note: bibtexparser could not parse {path.name} ({exc}); "
+            "using the built-in BibTeX parser",
+            file=sys.stderr,
+        )
+        return _parse_bib_fallback(text)
+
+
+# --------------------------------------------------------------------------
+# Formatting helpers
+# --------------------------------------------------------------------------
+
+def format_authors(raw: str) -> str:
+    if not raw:
+        return "未知作者"
+    parts = [part.strip() for part in re.split(r"\s+and\s+", raw, flags=re.I) if part.strip()]
+    if not parts:
+        return "未知作者"
+    first = parts[0]
+    surname = first.split(",")[0].strip() if "," in first else first.split()[-1]
+    surname = surname.strip("{} ").strip()
+    if not surname:
+        return "未知作者"
+    if surname.lower() == "others":
+        return "et al."
+    return surname + " et al." if len(parts) > 1 else surname
+
+
+def parse_year(raw: str) -> int:
+    match = re.search(r"\b(\d{4})\b", raw or "")
+    return int(match.group(1)) if match else 0
+
+
+def md_escape(text: str) -> str:
+    return text.replace("\\", "\\\\").replace("[", "\\[").replace("]", "\\]")
+
+
+@dataclass(frozen=True)
+class Entry:
+    area: str
+    title: str
+    authors: str
+    year: int
+    pdf: Path | None
+    source: Path
+
+    def render(self) -> str:
+        title = md_escape(self.title)
+        if self.pdf is not None:
+            rel = self.pdf.relative_to(ROOT).as_posix()
+            title = f"[{title}]({quote(rel, safe='/-._~')})"
+        else:
+            print(
+                f"warning: no PDF found for {self.source.relative_to(ROOT).as_posix()}, "
+                "rendering title without a link",
+                file=sys.stderr,
+            )
+        year = str(self.year) if self.year else "n.d."
+        return f"- {title} — {self.authors} — {year}"
+
+
+# --------------------------------------------------------------------------
+# Aggregation
+# --------------------------------------------------------------------------
+
+def collect_entries() -> list[Entry]:
+    if not PAPERS.is_dir():
+        return []
+    entries: list[Entry] = []
+    for user_dir in sorted(PAPERS.iterdir()):
+        if not user_dir.is_dir() or user_dir.name.startswith("."):
+            continue
+        for bib_dir in sorted(user_dir.iterdir()):
+            if not bib_dir.is_dir() or bib_dir.name.startswith("."):
+                continue
+            marker = bib_dir / MARKER
+            if not marker.is_file():
+                continue
+            area = " ".join(marker.read_text(encoding="utf-8").split())
+            if not area:
+                print(
+                    f"warning: empty marker at {marker.relative_to(ROOT).as_posix()}, skipped",
+                    file=sys.stderr,
+                )
+                continue
+
+            bib_files = sorted(bib_dir.glob("*.bib"))
+            if not bib_files:
+                print(
+                    f"warning: no .bib in {bib_dir.relative_to(ROOT).as_posix()}, skipped",
+                    file=sys.stderr,
+                )
+                continue
+            bib_path = (bib_dir / f"{bib_dir.name}.bib")
+            bib_path = bib_path if bib_path.is_file() else bib_files[0]
+
+            pdfs = sorted(bib_dir.glob("*.pdf"))
+            preferred = bib_dir / f"{bib_dir.name}.pdf"
+            pdf = preferred if preferred.is_file() else (pdfs[0] if pdfs else None)
+
+            for record in parse_bib(bib_path):
+                entries.append(
+                    Entry(
+                        area=area,
+                        title=record.get("title") or record.get("citekey") or bib_dir.name,
+                        authors=format_authors(record.get("author", "")),
+                        year=parse_year(record.get("year", "")),
+                        pdf=pdf,
+                        source=bib_dir,
+                    )
+                )
+    return entries
+
+
+def build_markdown(entries: list[Entry]) -> str:
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    lines = [
+        "# GroupPaperCollecting 文献清单",
+        "",
+        f"> 本文件由 GitHub Actions 自动生成，请勿手动编辑。最后更新于 {today}。",
+        ">",
+        "> A repository for students in our Group committing the reading Papers for Collecting.",
+        "> 按研究方向分节，节内按发表年份倒序排列；贡献方式见 [CONTRIBUTING.md](CONTRIBUTING.md)。",
+        "",
+    ]
+
+    if not entries:
+        lines += ["目前尚无收录文献。", ""]
+        return "\n".join(lines)
+
+    groups: dict[str, list[Entry]] = {}
+    for entry in entries:
+        groups.setdefault(entry.area, []).append(entry)
+
+    for area in sorted(groups, key=area_sort_key):
+        lines += [f"## {area}", ""]
+        for entry in sorted(
+            groups[area],
+            key=lambda item: (-item.year, item.title.lower(), item.source.as_posix()),
+        ):
+            lines.append(entry.render())
+        lines.append("")
+    return "\n".join(lines)
+
+
+def main() -> int:
+    content = build_markdown(collect_entries())
+    if README.is_file() and README.read_text(encoding="utf-8") == content:
+        print("README.md is already up to date.")
+        return 0
+    README.write_text(content, encoding="utf-8")
+    print(f"Wrote {README.relative_to(ROOT).as_posix()}.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

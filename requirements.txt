@@ -1,0 +1,4 @@
+# Only needed by scripts/build_readme.py. Both are optional: without them the
+# script falls back to its built-in BibTeX parser and code point sorting.
+bibtexparser>=1.4,<3
+pypinyin>=0.49
