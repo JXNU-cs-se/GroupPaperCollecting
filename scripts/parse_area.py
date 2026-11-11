@@ -16,9 +16,10 @@ never touch the same path. File names may contain spaces.
 Contract
 --------
 * The contributor declares the area in the commit message. The documented
-  template is ``<paper title> : [AREA: <area>]``, e.g.
-  ``WeSCE A Benchmark for Measuring Security : [AREA: Intelligence Software Engineering]``.
-  Only the bracketed part is parsed, so a leading description is harmless.
+  template is ``<n>： <paper file name> : [AREA: <area>]  :  [贡献人 ： <gh account>]``,
+  e.g. ``1： WeSCE A Benchmark for Measuring Security : [AREA: Intelligence Software Engineering]``.
+  Only the bracketed ``[AREA: ...]`` is parsed; the position number, the
+  trailing contributor field and any other prose are ignored.
 * For every paper stem that has a ``.pdf`` and/or ``.bib`` but no marker yet,
   this script writes the area name into ``<stem>.research-area``.
 * If any such stem cannot be assigned an unambiguous area, the script exits
@@ -31,6 +32,8 @@ Attribution rules (in order)
    ``<title> : [AREA: ...]``) is **ignored**: the paper keeps its existing
    marker, is never moved to another section, and the declaration is not
    inherited by a newly added paper. This is reported in the step summary.
+   A NEW (not yet categorised) paper is unaffected: its declaration is applied
+   and the paper is written into that area's section, as before.
 1. For a paper introduced by one of the commits in this push, use the
    ``[AREA: ...]`` value from *that specific commit*. This allows one push to
    contain several commits covering several different areas, as long as each
@@ -105,6 +108,12 @@ def declarations_in(message: str) -> list[tuple[str, str]]:
         title = ""
         if prefix.endswith((":", "：")):
             candidate = prefix[:-1].strip(" \t-—–·*#>")
+            # The documented template prefixes the file name with the paper's
+            # position in its section ("1： WeSCE …"). That number is not part
+            # of the title, so drop it (with its separator) before matching.
+            # A leading digit without a separator ("3D Gaussian Splatting") is
+            # part of the title and must survive.
+            candidate = re.sub(r"^\d+\s*[:：.、]\s*", "", candidate).strip()
             # Guard against a long prose line that merely happens to end with
             # a colon, and against a previously parsed "[AREA: ...]" fragment.
             if candidate and len(candidate) <= 200 and "[" not in candidate:

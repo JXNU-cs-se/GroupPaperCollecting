@@ -43,25 +43,29 @@ papers/
 
 ## 二、提交：commit message 声明研究方向
 
-**commit message 固定格式**（`[AREA: ...]` 必须写，前面的论文标题建议写上）：
+**commit message 固定格式**（`[AREA: ...]` 必须写）：
 
 ```text
-<论文标题> : [AREA: <研究方向名称>]
+该小节下的数字序号： <论文文件名> : [AREA: <研究方向名称>]  :  [贡献人 ： 项目成员的GitHub账号]
 ```
 
 典型示例：
 
 ```text
-WeSCE A Benchmark for Measuring Security : [AREA: Intelligence Software Engineering]
+1： WeSCE A Benchmark for Measuring Security : [AREA: Intelligence Software Engineering]  :  [贡献人 ： lihongweimail]
 ```
 
-也可以只写方向加简短描述：
+- **数字序号**：该论文在所属方向小节里的顺序号，新提交取该小节当前条目数 + 1。
+- **论文文件名**：与 `papers/<你的用户名>/` 下的文件名一致，不含扩展名。
+- **贡献人**：填你自己的 GitHub 账号，便于追溯。
+
+也可以只写方向加简短描述（不写序号与贡献人）：
 
 ```text
 [AREA: 大模型推理优化] 添加 Smith 2024 关于 KV Cache 压缩的工作
 ```
 
-两种写法等价：解析器只取方括号里的内容，前面的文字不影响归属。`[ AREA: … ]`、全角 `【AREA：…】` 也能识别。这段规范同时固定显示在 `README.md` 顶部。
+只有方括号里的 `[AREA: ...]` 会被解析；序号、贡献人和其余文字都不影响归属。`[ AREA: … ]`、全角 `【AREA：…】` 也能识别。这段规范同时固定显示在 `README.md` 顶部。
 
 ```bash
 # 一次性：启用仓库自带的 pre-commit hook
@@ -85,7 +89,7 @@ git push origin main
    - 它的 bib 信息**不会**再被追加进任何研究方向小节，README 里始终只出现一次；
    - 这条声明也**不会**被同一次提交里的新论文「继承」。
 
-   只有尚未归类的新论文才需要写 `[AREA: ...]`。日志与 Actions 运行摘要里会看到 `ignored: ...` 记录，那是正常的。
+   **新论文不受影响**：尚未归类的论文仍按原有行为，直接写入 `[AREA: ...]` 对应的研究方向小节。日志与 Actions 运行摘要里出现 `ignored: ...`，只代表那篇**已有论文**被跳过，属正常现象。
 
 ### 提交后自动发生什么
 
