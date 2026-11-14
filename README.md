@@ -2,7 +2,7 @@
 
 > 本文件由提交 hook / GitHub Actions 自动生成，请勿手动编辑。最后更新于 2026-11-11。
 >
-> A repository for students in our Group be committing the reading Papers for Collecting.
+> A repository for students in our Group is committing the reading Papers for Collecting.
 
 ## 提交前必读：commit 注释必须写全 4 段信息
 
